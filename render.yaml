@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: emoto-erp
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeployTrigger: commit
+    healthCheckPath: /health
+    numInstances: 1
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: DATA_DIR
+        value: /var/data
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: BOOTSTRAP_TOKEN
+        sync: false
+      - key: SESSION_HOURS
+        value: "12"
+    disk:
+      name: emoto-data
+      mountPath: /var/data
+      sizeGB: 1
+
