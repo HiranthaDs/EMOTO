@@ -21,7 +21,7 @@ if (-not (Test-Path -LiteralPath '.env')) {
     Write-Warning 'Created .env. Replace SESSION_SECRET and BOOTSTRAP_TOKEN before using the application.'
 }
 Push-Location backend
-try { & ..\.venv\Scripts\python.exe -m alembic upgrade head } finally { Pop-Location }
+try { & ..\.venv\Scripts\python.exe -m app.migrate } finally { Pop-Location }
 
 Write-Host ''
 Write-Host 'Setup complete.' -ForegroundColor Green

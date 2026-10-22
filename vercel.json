@@ -1,0 +1,17 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "fastapi",
+  "buildCommand": "npm --prefix frontend ci && npm --prefix frontend run build",
+  "regions": ["sin1"],
+  "env": {
+    "APP_ENV": "production",
+    "DATA_DIR": "/tmp/emoto"
+  },
+  "functions": {
+    "index.py": {
+      "maxDuration": 60,
+      "includeFiles": "{backend/**,frontend/dist/**}",
+      "excludeFiles": "{.git/**,.venv/**,backend/tests/**,docs/**,frontend/node_modules/**,playwright-report/**,test-results/**,**/__pycache__/**}"
+    }
+  }
+}

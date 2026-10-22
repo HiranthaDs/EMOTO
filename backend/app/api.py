@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import shutil
 import sqlite3
@@ -36,6 +37,7 @@ from .security import audit, current_user, hash_password, new_session, require, 
 router = APIRouter(prefix="/api/v1")
 SAFE_UPLOADS = {"application/pdf": ".pdf", "image/jpeg": ".jpg", "image/png": ".png", "text/csv": ".csv"}
 LOGIN_ATTEMPTS: dict[str, deque[float]] = defaultdict(deque)
+MAX_UPLOAD_BYTES = 4 * 1024 * 1024 if os.environ.get("VERCEL") else 10 * 1024 * 1024
 
 
 def data(model: Any, *, hide: set[str] | None = None) -> dict:
@@ -1013,8 +1015,8 @@ def user_create(payload: UserIn, user: User = Depends(require("users:manage")), 
 async def upload_attachment(entity_type: str, entity_id: int, file: UploadFile = File(...), user: User = Depends(current_user), db: DBSession = Depends(get_db)):
     if entity_type not in {"supplier", "rfq", "customer", "vehicle", "invoice", "warranty"}: raise HTTPException(422, "Unsupported attachment target")
     if file.content_type not in SAFE_UPLOADS: raise HTTPException(415, "Only PDF, JPEG, PNG, and CSV files are accepted")
-    content = await file.read(10 * 1024 * 1024 + 1)
-    if len(content) > 10 * 1024 * 1024: raise HTTPException(413, "File exceeds 10 MB limit")
+    content = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(content) > MAX_UPLOAD_BYTES: raise HTTPException(413, f"File exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit")
     if file.content_type == "application/pdf" and not content.startswith(b"%PDF-"): raise HTTPException(415, "Invalid PDF content")
     if file.content_type == "image/png" and not content.startswith(b"\x89PNG\r\n\x1a\n"): raise HTTPException(415, "Invalid PNG content")
     if file.content_type == "image/jpeg" and not content.startswith(b"\xff\xd8\xff"): raise HTTPException(415, "Invalid JPEG content")

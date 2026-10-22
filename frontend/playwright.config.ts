@@ -8,7 +8,7 @@ export default defineConfig({
   reporter: 'list',
   use: { baseURL: 'http://127.0.0.1:10001', channel: 'chrome', screenshot: 'only-on-failure', trace: 'retain-on-failure' },
   webServer: {
-    command: '..\\.venv\\Scripts\\python.exe -m alembic upgrade head && ..\\.venv\\Scripts\\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 10001',
+    command: '..\\.venv\\Scripts\\python.exe -m app.migrate && ..\\.venv\\Scripts\\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 10001',
     cwd: '../backend',
     env: { ...process.env, DATA_DIR: 'data/e2e', BOOTSTRAP_TOKEN: 'e2e-bootstrap-token', SESSION_SECRET: 'e2e-session-secret-long-enough-for-testing' },
     url: 'http://127.0.0.1:10001/health',

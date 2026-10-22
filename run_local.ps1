@@ -3,7 +3,7 @@ $ProjectRoot = $PSScriptRoot
 if (-not (Test-Path -LiteralPath "$ProjectRoot\.venv\Scripts\python.exe")) { throw 'Run .\setup_local.ps1 first.' }
 
 Push-Location "$ProjectRoot\backend"
-try { & "$ProjectRoot\.venv\Scripts\python.exe" -m alembic upgrade head } finally { Pop-Location }
+try { & "$ProjectRoot\.venv\Scripts\python.exe" -m app.migrate } finally { Pop-Location }
 Push-Location "$ProjectRoot\frontend"
 try { & npm.cmd run build } finally { Pop-Location }
 
