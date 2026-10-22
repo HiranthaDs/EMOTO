@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Res
 from fastapi.responses import FileResponse, StreamingResponse
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.graphics.barcode import qr
 from reportlab.graphics.shapes import Drawing
@@ -67,6 +67,22 @@ def add_months(value: date, months: int) -> date:
     year = value.year + month_index // 12
     month = month_index % 12 + 1
     return value.replace(year=year, month=month, day=min(value.day, calendar.monthrange(year, month)[1]))
+
+
+def human_duration(days: int) -> str:
+    if days <= 0:
+        return ""
+    for size, unit in ((365, "year"), (30, "month"), (7, "week")):
+        if days % size == 0:
+            value = days // size
+            return f"{value} {unit}{'' if value == 1 else 's'}"
+    return f"{days} day{'' if days == 1 else 's'}"
+
+
+def warranty_copy(days: int, start: date) -> str | None:
+    if days <= 0:
+        return None
+    return f"{human_duration(days)} warranty · valid until {(start + timedelta(days=days)).isoformat()}"
 
 
 def quotation_total(quotation: Quotation) -> int:
@@ -176,14 +192,14 @@ def customer_document(db: DBSession, kind: str, document_id: int) -> dict:
         if not document: raise HTTPException(404, "Quotation not found")
         customer = db.get(Customer, document.customer_id)
         vehicle = db.get(Vehicle, document.vehicle_id) if document.vehicle_id else None
-        return {"type": kind, "number": document.number, "status": document.status, "date": document.quote_date, "expiry_date": document.expiry_date, "customer": {"name": customer.full_name, "business_name": customer.business_name, "phone": customer.phone, "address": customer.billing_address or customer.address}, "vehicle": data(vehicle) if vehicle else None, "items": [{"description": item.description, "quantity": item.quantity, "unit_price_cents": item.unit_price_cents, "warranty": item.warranty, "amount_cents": item.quantity * item.unit_price_cents} for item in document.items], "discount_cents": document.discount_cents, "additional_charges_cents": document.additional_charges_cents, "total_cents": quotation_total(document), "notes": document.notes}
+        return {"type": kind, "number": document.number, "status": document.status, "date": document.quote_date, "expiry_date": document.expiry_date, "customer": {"name": customer.full_name, "business_name": customer.business_name, "phone": customer.phone, "address": customer.billing_address or customer.address}, "vehicle": data(vehicle) if vehicle else None, "items": [{"description": item.description, "quantity": item.quantity, "unit_price_cents": item.unit_price_cents, "warranty": item.warranty or warranty_copy(item.warranty_days, document.quote_date), "warranty_days": item.warranty_days, "amount_cents": item.quantity * item.unit_price_cents} for item in document.items], "discount_cents": document.discount_cents, "additional_charges_cents": document.additional_charges_cents, "total_cents": quotation_total(document), "notes": document.notes}
     if kind == "invoice":
         document = db.scalar(select(Invoice).options(selectinload(Invoice.items)).where(Invoice.id == document_id))
         if not document: raise HTTPException(404, "Invoice not found")
         customer = db.get(Customer, document.customer_id)
         order = db.get(SalesOrder, document.order_id)
         vehicle = db.get(Vehicle, order.vehicle_id) if order and order.vehicle_id else None
-        return {"type": kind, "number": document.number, "status": document.status, "date": document.issue_date, "customer": {"name": customer.full_name, "business_name": customer.business_name, "phone": customer.phone, "address": customer.billing_address or customer.address}, "vehicle": data(vehicle) if vehicle else None, "items": [{"description": item.description, "quantity": item.quantity, "unit_price_cents": item.unit_price_cents, "amount_cents": item.quantity * item.unit_price_cents} for item in document.items], "total_cents": document.total_cents, "paid_cents": document.paid_cents, "balance_cents": document.total_cents - document.paid_cents}
+        return {"type": kind, "number": document.number, "status": document.status, "date": document.issue_date, "customer": {"name": customer.full_name, "business_name": customer.business_name, "phone": customer.phone, "address": customer.billing_address or customer.address}, "vehicle": data(vehicle) if vehicle else None, "items": [{"description": item.description, "quantity": item.quantity, "unit_price_cents": item.unit_price_cents, "warranty": warranty_copy(item.warranty_days, document.issue_date), "warranty_days": item.warranty_days, "amount_cents": item.quantity * item.unit_price_cents} for item in document.items], "total_cents": document.total_cents, "paid_cents": document.paid_cents, "balance_cents": document.total_cents - document.paid_cents}
     raise HTTPException(422, "Unsupported document type")
 
 
@@ -458,6 +474,16 @@ def pos_customer_search(q: str = Query("", max_length=80), user: User = Depends(
     return {"items": [{**data(customer), "vehicles": [data(vehicle) for vehicle in customer.vehicles]} for customer in customers]}
 
 
+@router.get("/pos/suppliers")
+def pos_suppliers(q: str = Query("", max_length=80), user: User = Depends(require("pos:manage")), db: DBSession = Depends(get_db)):
+    query = select(Supplier).where(Supplier.status == "Active")
+    if q.strip():
+        match = f"%{q.strip()}%"
+        query = query.where(or_(Supplier.company_name.ilike(match), Supplier.code.ilike(match), Supplier.contact_person.ilike(match)))
+    suppliers = db.scalars(query.order_by(Supplier.company_name).limit(100)).all()
+    return {"items": [{"id": supplier.id, "code": supplier.code, "company_name": supplier.company_name, "contact_person": supplier.contact_person, "phone": supplier.phone, "supplier_reference": supplier.supplier_reference} for supplier in suppliers]}
+
+
 @router.post("/pos/checkout", status_code=201)
 def pos_checkout(payload: POSCheckoutIn, user: User = Depends(require("pos:manage")), db: DBSession = Depends(get_db)):
     customer = db.get(Customer, payload.customer_id)
@@ -479,11 +505,11 @@ def pos_checkout(payload: POSCheckoutIn, user: User = Depends(require("pos:manag
         if part:
             if part.physical_qty - part.reserved_qty < line.quantity: raise HTTPException(409, f"Insufficient available stock for {part.name}")
             apply_inventory_movement(db, user, part, "issue", line.quantity, reference_type="pos", reference_id=order.id, document_reference=order.number, notes=f"POS issue for {order.number}")
-        order_item = SalesOrderItem(part_id=part.id if part else None, service_id=service.id if service else None, description=line.description, quantity=line.quantity, unit_price_cents=line.unit_price_cents, cost_cents=part.purchase_cost_cents if part else 0, fulfilled_qty=line.quantity)
+        order_item = SalesOrderItem(part_id=part.id if part else None, service_id=service.id if service else None, supplier_id=part.default_supplier_id if part else None, description=line.description, quantity=line.quantity, unit_price_cents=line.unit_price_cents, cost_cents=part.purchase_cost_cents if part else 0, warranty_days=line.warranty_days, fulfilled_qty=line.quantity)
         order.items.append(order_item); order_lines.append((line, order_item))
     db.flush()
     invoice = Invoice(number=sequence(db, "invoice", "INV"), order_id=order.id, customer_id=customer.id, total_cents=total, paid_cents=payload.payment_amount_cents, status="Paid" if payload.payment_amount_cents == total else "Partially Paid" if payload.payment_amount_cents else "Unpaid")
-    invoice.items = [InvoiceItem(order_item_id=order_item.id, part_id=order_item.part_id, service_id=order_item.service_id, description=line.description, quantity=line.quantity, unit_price_cents=line.unit_price_cents) for line, order_item in order_lines]
+    invoice.items = [InvoiceItem(order_item_id=order_item.id, part_id=order_item.part_id, service_id=order_item.service_id, description=line.description, quantity=line.quantity, unit_price_cents=line.unit_price_cents, warranty_days=line.warranty_days) for line, order_item in order_lines]
     db.add(invoice); db.flush()
     if payload.payment_amount_cents:
         db.add(Payment(invoice_id=invoice.id, amount_cents=payload.payment_amount_cents, method=payload.payment_method, reference=payload.payment_reference, recorded_by=user.id))
@@ -621,6 +647,7 @@ def quotation_create(payload: QuotationIn, user: User = Depends(require("quotati
         values = line.model_dump()
         if values["unit_cost_cents"] == 0 and part: values["unit_cost_cents"] = part.purchase_cost_cents
         if not values["supplier_reference"] and supplier: values["supplier_reference"] = supplier.supplier_reference
+        if values["warranty_days"] and not values["warranty"]: values["warranty"] = warranty_copy(values["warranty_days"], quotation.quote_date)
         quotation.items.append(QuotationItem(**values))
     db.add(quotation); db.flush(); audit(db, user, "quotation.create", "quotation", quotation.id); db.commit()
     result = data(quotation); result["total_cents"] = quotation_total(quotation)
@@ -660,7 +687,7 @@ def quotation_convert(quotation_id: int, user: User = Depends(require("orders:ma
         part = db.get(Part, item.part_id) if item.part_id else None
         if part and part.physical_qty - part.reserved_qty >= item.quantity:
             apply_inventory_movement(db, user, part, "reserve", item.quantity, reference_type="order", reference_id=order.id, document_reference=order.number, notes=f"Reserved for {order.number}")
-        order.items.append(SalesOrderItem(part_id=item.part_id, service_id=item.service_id, supplier_id=item.supplier_id, supplier_reference=item.supplier_reference, description=item.description, quantity=item.quantity, unit_price_cents=item.unit_price_cents, cost_cents=item.unit_cost_cents or (part.purchase_cost_cents if part else 0)))
+        order.items.append(SalesOrderItem(part_id=item.part_id, service_id=item.service_id, supplier_id=item.supplier_id, supplier_reference=item.supplier_reference, description=item.description, quantity=item.quantity, unit_price_cents=item.unit_price_cents, cost_cents=item.unit_cost_cents or (part.purchase_cost_cents if part else 0), warranty_days=item.warranty_days))
     quotation.status = "Converted"; db.flush(); audit(db, user, "quotation.convert", "order", order.id); db.commit()
     return data(order)
 
@@ -694,7 +721,7 @@ def generate_invoice(order_id: int, user: User = Depends(require("invoices:manag
     if order.status == "Cancelled": raise HTTPException(409, "Cancelled orders cannot be invoiced")
     invoice_total = max(0, sum(x.quantity * x.unit_price_cents for x in order.items) - order.discount_cents + order.additional_charges_cents)
     invoice = Invoice(number=sequence(db, "invoice", "INV"), order_id=order.id, customer_id=order.customer_id, total_cents=invoice_total)
-    invoice.items = [InvoiceItem(order_item_id=x.id, part_id=x.part_id, service_id=x.service_id, description=x.description, quantity=x.quantity, unit_price_cents=x.unit_price_cents) for x in order.items]
+    invoice.items = [InvoiceItem(order_item_id=x.id, part_id=x.part_id, service_id=x.service_id, description=x.description, quantity=x.quantity, unit_price_cents=x.unit_price_cents, warranty_days=x.warranty_days) for x in order.items]
     db.add(invoice); db.flush(); audit(db, user, "invoice.create", "invoice", invoice.id); db.commit()
     return data(invoice)
 
@@ -715,7 +742,7 @@ def invoice_detail(invoice_id: int, user: User = Depends(require("invoices:view"
     for item in invoice.items:
         source = order_items.get(item.order_item_id)
         supplier = db.get(Supplier, source.supplier_id) if source and source.supplier_id else None
-        result["items"].append({**data(item), "supplier": data(supplier, hide={"bank_details"}) if supplier else None, "supplier_reference": source.supplier_reference if source else None})
+        result["items"].append({**data(item), "supplier": data(supplier, hide={"bank_details"}) if supplier else None, "supplier_reference": source.supplier_reference if source else None, "unit_cost_cents": source.cost_cents if source else 0, "warranty": warranty_copy(item.warranty_days, invoice.issue_date)})
     result["payments"] = [data(payment) for payment in invoice.payments]
     result["balance_cents"] = invoice.total_cents - invoice.paid_cents
     return result
@@ -776,45 +803,88 @@ def verified_share_url(db: DBSession, request: Request, kind: str, document_id: 
 
 
 def document_pdf(document: dict, qr_url: str | None = None) -> bytes:
-    stream = BytesIO(); pdf = SimpleDocTemplate(stream, pagesize=A4, rightMargin=16*mm, leftMargin=16*mm, topMargin=15*mm, bottomMargin=15*mm, title=f"{document['number']} - EMOTO")
-    styles = getSampleStyleSheet(); green = colors.HexColor("#249b68"); dark = colors.HexColor("#171717"); line = colors.HexColor("#dddddd")
-    title = "INVOICE" if document["type"] == "invoice" else "QUOTATION"
-    brand = Paragraph("<font size='18'><b>EMOTO</b></font><br/><font color='#249b68' size='8'>BMW SPARE PARTS</font>", styles["BodyText"])
-    meta = Paragraph(f"<font size='16'><b>{title}</b></font><br/><font size='9' color='#666666'>{document['number']}<br/>{document['date']}</font>", styles["BodyText"])
-    header = Table([[brand, meta]], colWidths=[115*mm, 62*mm]); header.setStyle(TableStyle([("ALIGN", (1,0), (1,0), "RIGHT"), ("VALIGN", (0,0), (-1,-1), "TOP"), ("BOTTOMPADDING", (0,0), (-1,-1), 8*mm)]))
+    stream = BytesIO()
+    pdf = SimpleDocTemplate(stream, pagesize=A4, rightMargin=15*mm, leftMargin=15*mm, topMargin=13*mm, bottomMargin=18*mm, title=f"{document['number']} - EMOTO")
+    styles = getSampleStyleSheet()
+    green = colors.HexColor("#24B47E")
+    muted = colors.HexColor("#6B706D"); border = colors.HexColor("#DDE3DF"); soft = colors.HexColor("#F2FAF6"); paper = colors.HexColor("#FBFCFB")
     safe = lambda value: escape(str(value or ""))
+    title = "INVOICE" if document["type"] == "invoice" else "QUOTATION"
+
+    def para(value: str, size: float = 8.5, color: str = "#1C1C1C", leading: float = 12, bold: bool = False):
+        markup = f"<b>{value}</b>" if bold else value
+        style = ParagraphStyle("emoto-document", parent=styles["BodyText"], fontName="Helvetica", fontSize=size, leading=leading, textColor=colors.HexColor(color))
+        return Paragraph(markup, style)
+
+    def draw_page(canvas, doc):
+        canvas.saveState()
+        canvas.setStrokeColor(green); canvas.setLineWidth(2); canvas.line(15*mm, A4[1]-8*mm, A4[0]-15*mm, A4[1]-8*mm)
+        canvas.setFont("Helvetica", 7); canvas.setFillColor(muted)
+        canvas.drawString(15*mm, 9*mm, "EMOTO · BMW SPARE PARTS")
+        canvas.drawRightString(A4[0]-15*mm, 9*mm, f"{document['number']}  ·  PAGE {doc.page}")
+        canvas.restoreState()
+
+    brand = Paragraph("<font name='Helvetica-Bold' size='21' color='#1C1C1C'>EMOTO</font><br/><font name='Helvetica' size='7.5' color='#24B47E'>BMW SPARE PARTS · COLOMBO</font>", styles["BodyText"])
+    status = safe(str(document.get("status") or "Draft").upper())
+    heading = Paragraph(f"<font name='Helvetica' size='7' color='#176B4D'>{status}</font><br/><font name='Helvetica-Bold' size='20' color='#1C1C1C'>{title}</font><br/><font name='Helvetica' size='9' color='#6B706D'>{safe(document['number'])}</font>", styles["BodyText"])
+    header = Table([[brand, heading]], colWidths=[112*mm, 68*mm])
+    header.setStyle(TableStyle([("ALIGN", (1,0), (1,0), "RIGHT"), ("VALIGN", (0,0), (-1,-1), "TOP"), ("TOPPADDING", (0,0), (-1,-1), 4*mm), ("BOTTOMPADDING", (0,0), (-1,-1), 7*mm)]))
+
     customer = document["customer"]; vehicle = document.get("vehicle")
-    customer_text = f"<font size='8' color='#777777'>CUSTOMER</font><br/><b>{safe(customer.get('name'))}</b><br/>{safe(customer.get('business_name'))}<br/>{safe(customer.get('phone'))}<br/>{safe(customer.get('address'))}"
-    vehicle_text = "<font size='8' color='#777777'>VEHICLE</font><br/>Not specified"
+    customer_lines = [safe(customer.get("name"))]
+    customer_lines += [safe(value) for value in (customer.get("business_name"), customer.get("phone"), customer.get("address")) if value]
+    customer_text = "<br/>".join(customer_lines)
     if vehicle:
-        vehicle_details = " / ".join(safe(x) for x in [vehicle.get("year"), vehicle.get("chassis_code"), vehicle.get("engine")] if x)
-        vehicle_text = f"<font size='8' color='#777777'>VEHICLE</font><br/><b>BMW {safe(vehicle.get('model'))}</b><br/>{safe(vehicle.get('registration_number'))}<br/>{vehicle_details}"
-    date_label = "ISSUE DATE" if document["type"] == "invoice" else "QUOTE DATE"
-    date_text = f"<font size='8' color='#777777'>{date_label}</font><br/><b>{document['date']}</b>"
-    if document.get("expiry_date"): date_text += f"<br/><br/><font size='8' color='#777777'>VALID UNTIL</font><br/><b>{document['expiry_date']}</b>"
-    parties = Table([[Paragraph(customer_text, styles["BodyText"]), Paragraph(vehicle_text, styles["BodyText"]), Paragraph(date_text, styles["BodyText"])]], colWidths=[72*mm, 65*mm, 40*mm])
-    parties.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,-1), colors.HexColor("#f5f7f6")), ("BOX", (0,0), (-1,-1), .5, line), ("INNERGRID", (0,0), (-1,-1), .5, line), ("VALIGN", (0,0), (-1,-1), "TOP"), ("LEFTPADDING", (0,0), (-1,-1), 10), ("RIGHTPADDING", (0,0), (-1,-1), 10), ("TOPPADDING", (0,0), (-1,-1), 10), ("BOTTOMPADDING", (0,0), (-1,-1), 10)]))
-    rows = [["Description", "Qty", "Unit price", "Amount"]]
+        vehicle_title = f"BMW {safe(vehicle.get('model'))}"
+        vehicle_lines = [safe(vehicle.get("registration_number"))]
+        details = " · ".join(safe(value) for value in (vehicle.get("year"), vehicle.get("chassis_code"), vehicle.get("engine")) if value)
+        if details: vehicle_lines.append(details)
+        if vehicle.get("vin"): vehicle_lines.append(f"VIN {safe(vehicle.get('vin'))}")
+        vehicle_text = f"<b>{vehicle_title}</b><br/>" + "<br/>".join(vehicle_lines)
+    else:
+        vehicle_text = "Vehicle not specified"
+    date_label = "ISSUED" if document["type"] == "invoice" else "QUOTED"
+    date_text = f"<b>{safe(document['date'])}</b>"
+    if document.get("expiry_date"): date_text += f"<br/><font color='#6B706D'>Valid until {safe(document['expiry_date'])}</font>"
+    cards = Table([
+        [para("BILL TO", 7, "#6B706D", 9, True), para("BMW", 7, "#6B706D", 9, True), para(date_label, 7, "#6B706D", 9, True)],
+        [para(customer_text, 9, "#1C1C1C", 13, True), para(vehicle_text, 9, "#1C1C1C", 13), para(date_text, 9, "#1C1C1C", 13)],
+    ], colWidths=[74*mm, 68*mm, 38*mm])
+    cards.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,-1), soft), ("BOX", (0,0), (-1,-1), .6, border), ("INNERGRID", (0,0), (-1,-1), .45, border), ("VALIGN", (0,0), (-1,-1), "TOP"), ("LEFTPADDING", (0,0), (-1,-1), 10), ("RIGHTPADDING", (0,0), (-1,-1), 10), ("TOPPADDING", (0,0), (-1,0), 9), ("BOTTOMPADDING", (0,0), (-1,0), 3), ("TOPPADDING", (0,1), (-1,1), 2), ("BOTTOMPADDING", (0,1), (-1,1), 11)]))
+
+    rows = [[para("ITEM / CUSTOMER REQUIREMENT", 7, "#176B4D", 9, True), para("QTY", 7, "#176B4D", 9, True), para("UNIT PRICE", 7, "#176B4D", 9, True), para("AMOUNT", 7, "#176B4D", 9, True)]]
     for item in document["items"]:
-        description = safe(item["description"]) + (f"\n{safe(item['warranty'])}" if item.get("warranty") else "")
-        rows.append([description, str(item["quantity"]), f"LKR {item['unit_price_cents']/100:,.2f}", f"LKR {item['amount_cents']/100:,.2f}"])
-    items = Table(rows, colWidths=[92*mm, 16*mm, 34*mm, 35*mm], repeatRows=1)
-    items.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,0), dark), ("TEXTCOLOR", (0,0), (-1,0), colors.white), ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"), ("FONTSIZE", (0,0), (-1,-1), 8), ("ALIGN", (1,1), (-1,-1), "RIGHT"), ("GRID", (0,0), (-1,-1), .35, line), ("VALIGN", (0,0), (-1,-1), "TOP"), ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#fafafa")]), ("TOPPADDING", (0,0), (-1,-1), 8), ("BOTTOMPADDING", (0,0), (-1,-1), 8)]))
-    totals = []
-    if document.get("discount_cents"): totals.append(["Discount", f"- LKR {document['discount_cents']/100:,.2f}"])
-    if document.get("additional_charges_cents"): totals.append(["Additional charges", f"LKR {document['additional_charges_cents']/100:,.2f}"])
-    totals.append(["TOTAL", f"LKR {document['total_cents']/100:,.2f}"])
-    if document["type"] == "invoice": totals += [["Paid", f"LKR {document['paid_cents']/100:,.2f}"], ["BALANCE DUE", f"LKR {document['balance_cents']/100:,.2f}"]]
-    total_table = Table(totals, colWidths=[42*mm, 43*mm], hAlign="RIGHT"); total_table.setStyle(TableStyle([("ALIGN", (1,0), (-1,-1), "RIGHT"), ("FONTNAME", (0,-1), (-1,-1), "Helvetica-Bold"), ("FONTSIZE", (0,0), (-1,-1), 9), ("LINEABOVE", (0,-1), (-1,-1), .8, dark), ("TOPPADDING", (0,0), (-1,-1), 6), ("BOTTOMPADDING", (0,0), (-1,-1), 6)]))
-    story = [header, parties, Spacer(1, 7*mm), items, Spacer(1, 5*mm), total_table]
-    if document.get("notes"): story += [Spacer(1, 6*mm), Paragraph(f"<font size='8' color='#777777'>NOTES</font><br/>{safe(document['notes'])}", styles["BodyText"])]
+        description = f"<b>{safe(item['description'])}</b>"
+        if item.get("warranty"): description += f"<br/><font size='7.5' color='#176B4D'>{safe(item['warranty'])}</font>"
+        rows.append([para(description, 9, "#1C1C1C", 13), para(str(item["quantity"]), 8.5, "#1C1C1C"), para(f"LKR {item['unit_price_cents']/100:,.2f}", 8.5, "#1C1C1C"), para(f"LKR {item['amount_cents']/100:,.2f}", 8.5, "#1C1C1C", 12, True)])
+    items = Table(rows, colWidths=[96*mm, 15*mm, 32*mm, 37*mm], repeatRows=1)
+    items.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,0), colors.HexColor("#E9F7F0")), ("BOX", (0,0), (-1,-1), .55, border), ("LINEBELOW", (0,0), (-1,-1), .45, border), ("VALIGN", (0,0), (-1,-1), "TOP"), ("ALIGN", (1,0), (-1,-1), "RIGHT"), ("LEFTPADDING", (0,0), (-1,-1), 9), ("RIGHTPADDING", (0,0), (-1,-1), 9), ("TOPPADDING", (0,0), (-1,-1), 9), ("BOTTOMPADDING", (0,0), (-1,-1), 9), ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, paper])]))
+
+    totals = [[para("Subtotal", 8, "#6B706D"), para(f"LKR {(document['total_cents'] + document.get('discount_cents', 0) - document.get('additional_charges_cents', 0))/100:,.2f}", 8, "#1C1C1C", 11, True)]]
+    if document.get("discount_cents"): totals.append([para("Discount", 8, "#6B706D"), para(f"− LKR {document['discount_cents']/100:,.2f}", 8, "#1C1C1C", 11, True)])
+    if document.get("additional_charges_cents"): totals.append([para("Additional charges", 8, "#6B706D"), para(f"LKR {document['additional_charges_cents']/100:,.2f}", 8, "#1C1C1C", 11, True)])
+    totals.append([para("TOTAL", 8, "#176B4D", 11, True), para(f"LKR {document['total_cents']/100:,.2f}", 12, "#176B4D", 15, True)])
+    if document["type"] == "invoice":
+        totals += [[para("Paid", 8, "#6B706D"), para(f"LKR {document['paid_cents']/100:,.2f}", 8, "#1C1C1C", 11, True)], [para("BALANCE DUE", 8, "#176B4D", 11, True), para(f"LKR {document['balance_cents']/100:,.2f}", 10, "#176B4D", 13, True)]]
+    total_table = Table(totals, colWidths=[41*mm, 47*mm], hAlign="RIGHT")
+    total_table.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,-1), soft), ("BOX", (0,0), (-1,-1), .55, border), ("LINEABOVE", (0,-1), (-1,-1), .7, green), ("ALIGN", (1,0), (-1,-1), "RIGHT"), ("LEFTPADDING", (0,0), (-1,-1), 10), ("RIGHTPADDING", (0,0), (-1,-1), 10), ("TOPPADDING", (0,0), (-1,-1), 6), ("BOTTOMPADDING", (0,0), (-1,-1), 6)]))
+    story = [header, cards, Spacer(1, 7*mm), items, Spacer(1, 5*mm), total_table]
+    if document.get("notes"):
+        notes = safe(document["notes"]).replace("\n", "<br/>")
+        note_table = Table([[para("NOTES", 7, "#6B706D", 9, True)], [para(notes, 8.5, "#1C1C1C", 12)]], colWidths=[180*mm])
+        note_table.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,-1), paper), ("BOX", (0,0), (-1,-1), .5, border), ("LEFTPADDING", (0,0), (-1,-1), 10), ("RIGHTPADDING", (0,0), (-1,-1), 10), ("TOPPADDING", (0,0), (-1,-1), 7), ("BOTTOMPADDING", (0,0), (-1,-1), 7)]))
+        story += [Spacer(1, 6*mm), note_table]
     if qr_url:
-        widget = qr.QrCodeWidget(qr_url); bounds = widget.getBounds(); size = 27*mm
+        widget = qr.QrCodeWidget(qr_url); bounds = widget.getBounds(); size = 25*mm
         drawing = Drawing(size, size, transform=[size/(bounds[2]-bounds[0]), 0, 0, size/(bounds[3]-bounds[1]), 0, 0]); drawing.add(widget)
-        qr_block = Table([[drawing, Paragraph("<b>Scan to view this secure digital document</b><br/><font size='8' color='#666666'>The QR code opens the customer copy. Supplier and purchase-cost information is never included.</font>", styles["BodyText"])]], colWidths=[32*mm, 120*mm], hAlign="LEFT")
-        qr_block.setStyle(TableStyle([("VALIGN", (0,0), (-1,-1), "MIDDLE"), ("BOX", (0,0), (-1,-1), .5, green), ("LEFTPADDING", (0,0), (-1,-1), 8), ("RIGHTPADDING", (0,0), (-1,-1), 8), ("TOPPADDING", (0,0), (-1,-1), 8), ("BOTTOMPADDING", (0,0), (-1,-1), 8)])); story += [Spacer(1, 8*mm), qr_block]
-    story += [Spacer(1, 9*mm), Paragraph("Thank you for choosing EMOTO BMW Spare Parts.<br/><br/>Authorized signature: ______________________________", styles["BodyText"])]
-    pdf.build(story); return stream.getvalue()
+        qr_block = Table([[drawing, para("<b>OPEN THE SECURE CUSTOMER COPY</b><br/><font color='#6B706D'>Scan to view this invoice or quotation online. The link is protected, expires automatically, and never exposes supplier or internal cost information.</font>", 8.5, "#176B4D", 12)]], colWidths=[31*mm, 139*mm], hAlign="LEFT")
+        qr_block.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,-1), soft), ("VALIGN", (0,0), (-1,-1), "MIDDLE"), ("BOX", (0,0), (-1,-1), .7, green), ("LEFTPADDING", (0,0), (-1,-1), 8), ("RIGHTPADDING", (0,0), (-1,-1), 10), ("TOPPADDING", (0,0), (-1,-1), 7), ("BOTTOMPADDING", (0,0), (-1,-1), 7)]))
+        story += [Spacer(1, 7*mm), qr_block]
+    signoff = Table([[para("Thank you for choosing EMOTO.", 8.5, "#1C1C1C", 12, True), para("Authorized signature", 7, "#6B706D", 10)], [para("Precision parts and workshop care for your BMW.", 8, "#6B706D"), para("____________________________", 8, "#1C1C1C")]], colWidths=[112*mm, 68*mm])
+    signoff.setStyle(TableStyle([("ALIGN", (1,0), (1,-1), "RIGHT"), ("TOPPADDING", (0,0), (-1,-1), 2), ("BOTTOMPADDING", (0,0), (-1,-1), 2)]))
+    story += [Spacer(1, 8*mm), signoff]
+    pdf.build(story, onFirstPage=draw_page, onLaterPages=draw_page)
+    return stream.getvalue()
 
 
 @router.get("/quotations/{quotation_id}/pdf")
@@ -840,10 +910,13 @@ def generate_warranties(invoice_id: int, user: User = Depends(require("warrantie
         part = db.get(Part, item.part_id) if item.part_id else None
         if existing:
             created.append(existing); continue
-        if not part or part.warranty_months <= 0:
+        explicit_days = item.warranty_days
+        if explicit_days <= 0 and (not part or part.warranty_months <= 0):
             continue
         order_item = db.get(SalesOrderItem, item.order_item_id)
-        warranty = Warranty(invoice_id=invoice.id, invoice_item_id=item.id, customer_id=invoice.customer_id, vehicle_id=order.vehicle_id, part_id=part.id, supplier_id=order_item.supplier_id if order_item else part.default_supplier_id, supplier_reference=order_item.supplier_reference if order_item else None, start_date=invoice.issue_date, expiry_date=add_months(invoice.issue_date, part.warranty_months), conditions=f"{part.warranty_months}-month parts warranty; subject to configured business terms")
+        expiry = invoice.issue_date + timedelta(days=explicit_days) if explicit_days else add_months(invoice.issue_date, part.warranty_months)
+        duration = human_duration(explicit_days) if explicit_days else f"{part.warranty_months} month{'' if part.warranty_months == 1 else 's'}"
+        warranty = Warranty(invoice_id=invoice.id, invoice_item_id=item.id, customer_id=invoice.customer_id, vehicle_id=order.vehicle_id if order else None, part_id=part.id if part else None, supplier_id=order_item.supplier_id if order_item else (part.default_supplier_id if part else None), supplier_reference=order_item.supplier_reference if order_item else None, start_date=invoice.issue_date, expiry_date=expiry, conditions=f"{duration} warranty; subject to configured business terms")
         db.add(warranty); db.flush(); created.append(warranty)
     audit(db, user, "warranty.generate", "invoice", invoice.id, f"count={len(created)}"); db.commit()
     return [data(x) for x in created]

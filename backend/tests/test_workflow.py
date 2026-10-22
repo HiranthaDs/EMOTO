@@ -117,6 +117,10 @@ def test_pos_checkout_tracks_landed_cost_stock_payment_and_service_history(admin
     assert lookup.status_code == 200, lookup.text
     assert lookup.json()["items"][0]["id"] == profile["customer"]["id"]
     assert lookup.json()["items"][0]["vehicles"][0]["registration_number"] == "POS-320"
+    safe_suppliers = admin["client"].get("/api/v1/pos/suppliers")
+    assert safe_suppliers.status_code == 200
+    assert safe_suppliers.json()["items"][0]["company_name"] == "POS Parts Supplier"
+    assert "bank_details" not in safe_suppliers.text
 
     receipt = post(admin, "/inventory/movements", {
         "part_id": part["id"], "movement_type": "receive", "quantity": 10,
@@ -135,7 +139,7 @@ def test_pos_checkout_tracks_landed_cost_stock_payment_and_service_history(admin
         "lines": [
             {"item_type": "part", "part_id": part["id"], "description": "BMW engine oil", "quantity": 2, "unit_price_cents": 2500},
             {"item_type": "service", "service_id": service.json()["id"], "description": "Engine oil change", "quantity": 1, "unit_price_cents": 5000},
-            {"item_type": "manual", "description": "Workshop diagnostics", "quantity": 1, "unit_price_cents": 2000},
+            {"item_type": "manual", "description": "Workshop diagnostics", "quantity": 1, "unit_price_cents": 2000, "warranty_days": 14},
         ],
         "service_fee_cents": 1000, "discount_cents": 500, "payment_amount_cents": 12500,
         "payment_method": "Cash", "service_date": "2026-10-22", "odometer_km": 51000,
@@ -147,6 +151,13 @@ def test_pos_checkout_tracks_landed_cost_stock_payment_and_service_history(admin
     assert checkout.json()["invoice"]["paid_cents"] == 12500
     assert checkout.json()["invoice"]["status"] == "Paid"
     assert checkout.json()["balance_cents"] == 0
+    invoice_id = checkout.json()["invoice"]["id"]
+    invoice_detail = admin["client"].get(f"/api/v1/invoices/{invoice_id}")
+    assert invoice_detail.json()["items"][2]["warranty"] == "2 weeks warranty · valid until 2026-11-05"
+    warranties = post(admin, f"/invoices/{invoice_id}/warranties")
+    assert warranties.status_code == 201, warranties.text
+    assert warranties.json()[0]["part_id"] is None
+    assert warranties.json()[0]["expiry_date"] == "2026-11-05"
 
     inventory = admin["client"].get("/api/v1/inventory/overview").json()
     stocked = next(item for item in inventory["items"] if item["id"] == part["id"])
@@ -235,6 +246,7 @@ def test_customer_vehicle_supplier_history_and_public_quote(admin):
             "unit_cost_cents": 800000,
             "unit_price_cents": 1200000,
             "warranty": "12 months",
+            "warranty_days": 365,
         }],
     })
     assert quote.status_code == 201, quote.text
@@ -262,6 +274,7 @@ def test_customer_vehicle_supplier_history_and_public_quote(admin):
     assert public.json()["customer"]["name"] == "Kasun Silva"
     assert public.json()["vehicle"]["registration_number"] == "CAB-1234"
     assert public.json()["items"][0]["amount_cents"] == 2400000
+    assert public.json()["items"][0]["warranty_days"] == 365
     assert "supplier" not in public.text.lower()
     assert "unit_cost_cents" not in public.text
     printable = admin["client"].get(f"/api/v1/quotations/{quote.json()['id']}/pdf?share_token={token}")

@@ -244,6 +244,7 @@ class QuotationItem(Base):
     unit_price_cents: Mapped[int] = mapped_column(Integer)
     unit_cost_cents: Mapped[int] = mapped_column(Integer, default=0)
     warranty: Mapped[str | None] = mapped_column(String(200))
+    warranty_days: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class SalesOrder(Base, TimestampMixin):
@@ -273,6 +274,7 @@ class SalesOrderItem(Base):
     quantity: Mapped[int] = mapped_column(Integer)
     unit_price_cents: Mapped[int] = mapped_column(Integer)
     cost_cents: Mapped[int] = mapped_column(Integer, default=0)
+    warranty_days: Mapped[int] = mapped_column(Integer, default=0)
     fulfilled_qty: Mapped[int] = mapped_column(Integer, default=0)
 
 
@@ -300,6 +302,7 @@ class InvoiceItem(Base):
     description: Mapped[str] = mapped_column(String(255))
     quantity: Mapped[int] = mapped_column(Integer)
     unit_price_cents: Mapped[int] = mapped_column(Integer)
+    warranty_days: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class Payment(Base):

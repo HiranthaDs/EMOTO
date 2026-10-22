@@ -180,6 +180,7 @@ class LineIn(BaseModel):
     unit_price_cents: int = Field(ge=0)
     unit_cost_cents: int = Field(0, ge=0)
     warranty: str | None = None
+    warranty_days: int = Field(0, ge=0, le=3650)
 
 
 class QuotationIn(BaseModel):
@@ -216,6 +217,7 @@ class POSLineIn(BaseModel):
     description: str = Field(min_length=1, max_length=255)
     quantity: int = Field(gt=0)
     unit_price_cents: int = Field(ge=0)
+    warranty_days: int = Field(0, ge=0, le=3650)
 
     @model_validator(mode="after")
     def validate_source(self):
