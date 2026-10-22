@@ -385,7 +385,12 @@ def vehicles(q: str | None = None, page_no: int = Query(1, alias="page", ge=1), 
 @router.post("/vehicles", status_code=201)
 def vehicle_create(payload: VehicleIn, user: User = Depends(require("vehicles:manage")), db: DBSession = Depends(get_db)):
     if not db.get(Customer, payload.customer_id): raise HTTPException(404, "Customer not found")
-    vehicle = Vehicle(**payload.model_dump()); db.add(vehicle); db.flush(); audit(db, user, "vehicle.create", "vehicle", vehicle.id); db.commit()
+    values = payload.model_dump()
+    if values["registration_number"]:
+        values["registration_number"] = values["registration_number"].strip().upper()
+        if db.scalar(select(Vehicle).where(func.upper(Vehicle.registration_number) == values["registration_number"])):
+            raise HTTPException(409, "This vehicle registration is already linked to a customer")
+    vehicle = Vehicle(**values); db.add(vehicle); db.flush(); audit(db, user, "vehicle.create", "vehicle", vehicle.id); db.commit()
     return data(vehicle)
 
 
@@ -437,13 +442,29 @@ def service_records(customer_id: int | None = None, vehicle_id: int | None = Non
     return [{**data(record), "items": [data(item) for item in record.items]} for record in records]
 
 
+@router.get("/pos/customer-search")
+def pos_customer_search(q: str = Query("", max_length=80), user: User = Depends(require("pos:manage")), db: DBSession = Depends(get_db)):
+    query = select(Customer).options(selectinload(Customer.vehicles)).outerjoin(Vehicle).distinct()
+    term = q.strip()
+    if term:
+        match = f"%{term}%"
+        query = query.where(or_(
+            Customer.full_name.ilike(match), Customer.code.ilike(match), Customer.phone.ilike(match),
+            Customer.whatsapp.ilike(match), Customer.email.ilike(match),
+            Vehicle.registration_number.ilike(match), Vehicle.vin.ilike(match),
+            Vehicle.model.ilike(match), Vehicle.chassis_code.ilike(match),
+        ))
+    customers = db.scalars(query.order_by(Customer.updated_at.desc()).limit(12)).unique().all()
+    return {"items": [{**data(customer), "vehicles": [data(vehicle) for vehicle in customer.vehicles]} for customer in customers]}
+
+
 @router.post("/pos/checkout", status_code=201)
 def pos_checkout(payload: POSCheckoutIn, user: User = Depends(require("pos:manage")), db: DBSession = Depends(get_db)):
     customer = db.get(Customer, payload.customer_id)
     if not customer: raise HTTPException(404, "Customer not found")
     vehicle = db.get(Vehicle, payload.vehicle_id) if payload.vehicle_id else None
     if payload.vehicle_id and (not vehicle or vehicle.customer_id != customer.id): raise HTTPException(422, "Vehicle does not belong to the selected customer")
-    if any(line.item_type == "service" for line in payload.lines) and not vehicle: raise HTTPException(422, "Select a customer vehicle for workshop services")
+    if any(line.item_type in {"service", "manual"} for line in payload.lines) and not vehicle: raise HTTPException(422, "Select a customer vehicle for workshop services")
     subtotal = sum(line.quantity * line.unit_price_cents for line in payload.lines)
     total = max(0, subtotal + payload.service_fee_cents - payload.discount_cents)
     if payload.payment_amount_cents > total: raise HTTPException(409, "Payment exceeds invoice total")
@@ -467,7 +488,7 @@ def pos_checkout(payload: POSCheckoutIn, user: User = Depends(require("pos:manag
     if payload.payment_amount_cents:
         db.add(Payment(invoice_id=invoice.id, amount_cents=payload.payment_amount_cents, method=payload.payment_method, reference=payload.payment_reference, recorded_by=user.id))
     service_record = None
-    if vehicle and (any(line.item_type == "service" for line in payload.lines) or payload.service_fee_cents or payload.notes):
+    if vehicle and (any(line.item_type in {"service", "manual"} for line in payload.lines) or payload.service_fee_cents or payload.notes):
         service_record = ServiceRecord(number=sequence(db, "service_record", "JOB"), customer_id=customer.id, vehicle_id=vehicle.id, invoice_id=invoice.id, service_date=payload.service_date, odometer_km=payload.odometer_km, technician=payload.technician, next_service_date=payload.next_service_date, next_service_km=payload.next_service_km, notes=payload.notes, created_by=user.id)
         service_record.items = [ServiceRecordItem(service_id=line.service_id, part_id=line.part_id, description=line.description, quantity=line.quantity, unit_price_cents=line.unit_price_cents) for line in payload.lines]
         if payload.service_fee_cents: service_record.items.append(ServiceRecordItem(description="Workshop service fee", quantity=1, unit_price_cents=payload.service_fee_cents))

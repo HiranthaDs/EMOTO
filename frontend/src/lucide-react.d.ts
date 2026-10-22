@@ -10,4 +10,5 @@ declare module 'lucide-react' {
   export const ShoppingCart: Icon; export const Sun: Icon; export const Truck: Icon; export const Users: Icon
   export const Warehouse: Icon; export const Wrench: Icon; export const X: Icon; export const AlertTriangle: Icon
   export const ArrowUpRight: Icon; export const Download: Icon; export const DatabaseBackup: Icon; export const LogOut: Icon
+  export const UserPlus: Icon; export const CircleCheckBig: Icon; export const History: Icon; export const Phone: Icon; export const Mail: Icon
 }

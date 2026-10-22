@@ -113,6 +113,10 @@ def test_pos_checkout_tracks_landed_cost_stock_payment_and_service_history(admin
         "estimated_minutes": 45, "recommended_interval_km": 10000,
     })
     assert service.status_code == 201, service.text
+    lookup = admin["client"].get("/api/v1/pos/customer-search?q=POS-320")
+    assert lookup.status_code == 200, lookup.text
+    assert lookup.json()["items"][0]["id"] == profile["customer"]["id"]
+    assert lookup.json()["items"][0]["vehicles"][0]["registration_number"] == "POS-320"
 
     receipt = post(admin, "/inventory/movements", {
         "part_id": part["id"], "movement_type": "receive", "quantity": 10,
@@ -131,15 +135,16 @@ def test_pos_checkout_tracks_landed_cost_stock_payment_and_service_history(admin
         "lines": [
             {"item_type": "part", "part_id": part["id"], "description": "BMW engine oil", "quantity": 2, "unit_price_cents": 2500},
             {"item_type": "service", "service_id": service.json()["id"], "description": "Engine oil change", "quantity": 1, "unit_price_cents": 5000},
+            {"item_type": "manual", "description": "Workshop diagnostics", "quantity": 1, "unit_price_cents": 2000},
         ],
-        "service_fee_cents": 1000, "discount_cents": 500, "payment_amount_cents": 10500,
+        "service_fee_cents": 1000, "discount_cents": 500, "payment_amount_cents": 12500,
         "payment_method": "Cash", "service_date": "2026-10-22", "odometer_km": 51000,
         "technician": "Workshop A", "next_service_date": "2027-04-22", "next_service_km": 61000,
         "notes": "Oil and filter maintenance",
     })
     assert checkout.status_code == 201, checkout.text
-    assert checkout.json()["invoice"]["total_cents"] == 10500
-    assert checkout.json()["invoice"]["paid_cents"] == 10500
+    assert checkout.json()["invoice"]["total_cents"] == 12500
+    assert checkout.json()["invoice"]["paid_cents"] == 12500
     assert checkout.json()["invoice"]["status"] == "Paid"
     assert checkout.json()["balance_cents"] == 0
 
@@ -151,7 +156,7 @@ def test_pos_checkout_tracks_landed_cost_stock_payment_and_service_history(admin
     customer = admin["client"].get(f"/api/v1/customers/{profile['customer']['id']}").json()
     assert customer["vehicles"][0]["mileage_km"] == 51000
     assert customer["service_history"][0]["technician"] == "Workshop A"
-    assert len(customer["service_history"][0]["items"]) == 3
+    assert len(customer["service_history"][0]["items"]) == 4
     assert admin["client"].get("/api/v1/reports/inventory/pdf").headers["content-type"] == "application/pdf"
 
 
