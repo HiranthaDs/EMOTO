@@ -36,4 +36,8 @@ test('administrator can enter the workspace and use navigation', async ({ page }
   await page.getByRole('link', { name: 'Parts catalog' }).click()
   await expect(page.getByRole('heading', { name: 'Parts catalog' })).toBeVisible()
   await expect(page.getByRole('button', { name: /New part/i })).toBeVisible()
+  await page.goto('/inventory')
+  await expect(page.getByRole('heading', { name: 'Inventory control' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Update stock' })).toBeVisible()
+  await expect(page.getByText('Inventory value')).toBeVisible()
 })

@@ -7,6 +7,7 @@ import sqlite3
 import time
 import calendar
 import hashlib
+from html import escape
 from collections import defaultdict, deque
 from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
@@ -16,9 +17,11 @@ from typing import Any
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.responses import FileResponse, StreamingResponse
 from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
+from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import mm
+from reportlab.graphics.barcode import qr
+from reportlab.graphics.shapes import Drawing
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -90,6 +93,7 @@ def apply_inventory_movement(
     movement_date: date | None = None,
     supplier_id: int | None = None,
     unit_cost_cents: int | None = None,
+    overhead_cost_cents: int = 0,
     document_reference: str | None = None,
     batch_number: str | None = None,
     location: str | None = None,
@@ -130,6 +134,7 @@ def apply_inventory_movement(
         raise HTTPException(422, "Unsupported movement type")
 
     movement_cost = average_before if unit_cost_cents is None else unit_cost_cents
+    landed_unit_cost = round((qty * movement_cost + overhead_cost_cents) / qty) if qty else movement_cost
     physical_after = physical_before + physical_delta
     reserved_after = reserved_before + reserved_delta
     if physical_after < 0 or reserved_after < 0 or physical_after < reserved_after:
@@ -137,7 +142,7 @@ def apply_inventory_movement(
 
     if kind == "receive":
         if unit_cost_cents is None: raise HTTPException(422, "Unit purchase cost is required when receiving stock")
-        incoming_value = qty * unit_cost_cents
+        incoming_value = qty * unit_cost_cents + overhead_cost_cents
         part.purchase_cost_cents = round((physical_before * average_before + incoming_value) / physical_after) if physical_after else unit_cost_cents
         part.last_purchase_cost_cents = unit_cost_cents
         part.last_received_at = datetime.now(timezone.utc)
@@ -152,7 +157,8 @@ def apply_inventory_movement(
         quantity=qty, quantity_delta=physical_delta, reserved_delta=reserved_delta,
         quantity_before=physical_before, quantity_after=physical_after,
         reserved_before=reserved_before, reserved_after=reserved_after,
-        unit_cost_cents=movement_cost, total_cost_cents=qty * movement_cost,
+        unit_cost_cents=movement_cost, overhead_cost_cents=overhead_cost_cents, landed_unit_cost_cents=landed_unit_cost,
+        total_cost_cents=qty * movement_cost + overhead_cost_cents,
         stock_value_before_cents=physical_before * average_before,
         stock_value_after_cents=physical_after * part.purchase_cost_cents,
         supplier_id=supplier_id, movement_date=movement_date or date.today(),
@@ -279,6 +285,10 @@ def global_search(q: str = Query(min_length=2, max_length=80), user: User = Depe
     for model, kind, label_col, meta_col in specs:
         rows = db.scalars(select(model).where(or_(label_col.ilike(term), meta_col.ilike(term))).limit(5)).all()
         results.extend({"type": kind, "id": row.id, "label": getattr(row, label_col.key), "meta": getattr(row, meta_col.key)} for row in rows)
+    vehicles = db.scalars(select(Vehicle).where(or_(Vehicle.registration_number.ilike(term), Vehicle.vin.ilike(term), Vehicle.model.ilike(term))).limit(5)).all()
+    for vehicle in vehicles:
+        customer = db.get(Customer, vehicle.customer_id)
+        results.append({"type": "customer", "id": customer.id, "label": f"{vehicle.registration_number or vehicle.vin or 'BMW'} · {customer.full_name}", "meta": f"BMW {vehicle.model}"})
     return results[:20]
 
 
@@ -315,7 +325,13 @@ def supplier_update(supplier_id: int, payload: SupplierIn, user: User = Depends(
 
 @router.get("/customers")
 def customers(q: str | None = None, page_no: int = Query(1, alias="page", ge=1), size: int = Query(25, le=100), user: User = Depends(require("customers:view")), db: DBSession = Depends(get_db)):
-    return page(db, Customer, q, [Customer.full_name, Customer.code, Customer.phone, Customer.email], page_no, size)
+    query = select(Customer).outerjoin(Vehicle).distinct()
+    if q:
+        term = f"%{q}%"
+        query = query.where(or_(Customer.full_name.ilike(term), Customer.code.ilike(term), Customer.phone.ilike(term), Customer.email.ilike(term), Customer.business_name.ilike(term), Vehicle.registration_number.ilike(term), Vehicle.vin.ilike(term)))
+    total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
+    rows = db.scalars(query.order_by(Customer.id.desc()).offset((page_no - 1) * size).limit(size)).all()
+    return {"items": [data(row) for row in rows], "total": total, "page": page_no, "page_size": size}
 
 
 @router.get("/customers/{customer_id}")
@@ -326,6 +342,8 @@ def customer_detail(customer_id: int, user: User = Depends(require("customers:vi
     quotations = db.scalars(select(Quotation).options(selectinload(Quotation.items)).where(Quotation.customer_id == customer_id).order_by(Quotation.id.desc()).limit(20)).all()
     result["quotations"] = [{**data(x), "total_cents": quotation_total(x), "items": [{**data(item), "supplier": data(db.get(Supplier, item.supplier_id), hide={"bank_details"}) if item.supplier_id else None} for item in x.items]} for x in quotations]
     result["invoices"] = [data(x) for x in db.scalars(select(Invoice).where(Invoice.customer_id == customer_id).order_by(Invoice.id.desc()).limit(20))]
+    services = db.scalars(select(ServiceRecord).options(selectinload(ServiceRecord.items)).where(ServiceRecord.customer_id == customer_id).order_by(ServiceRecord.service_date.desc(), ServiceRecord.id.desc()).limit(20)).all()
+    result["service_history"] = [{**data(record), "vehicle": data(db.get(Vehicle, record.vehicle_id)), "items": [data(item) for item in record.items]} for record in services]
     result["lifetime_sales_cents"] = db.scalar(select(func.coalesce(func.sum(Invoice.total_cents), 0)).where(Invoice.customer_id == customer_id)) or 0
     result["outstanding_cents"] = db.scalar(select(func.coalesce(func.sum(Invoice.total_cents - Invoice.paid_cents), 0)).where(Invoice.customer_id == customer_id)) or 0
     return result
@@ -398,6 +416,67 @@ def part_create(payload: PartIn, user: User = Depends(require("parts:manage")), 
     return data(part)
 
 
+@router.get("/services")
+def services(q: str | None = None, page_no: int = Query(1, alias="page", ge=1), size: int = Query(100, le=100), user: User = Depends(require("services:view")), db: DBSession = Depends(get_db)):
+    return page(db, Service, q, [Service.code, Service.name, Service.category, Service.description], page_no, size)
+
+
+@router.post("/services", status_code=201)
+def service_create(payload: ServiceIn, user: User = Depends(require("services:manage")), db: DBSession = Depends(get_db)):
+    service = Service(code=sequence(db, "service", "SVC"), **payload.model_dump())
+    db.add(service); db.flush(); audit(db, user, "service.create", "service", service.id); db.commit()
+    return data(service)
+
+
+@router.get("/service-records")
+def service_records(customer_id: int | None = None, vehicle_id: int | None = None, user: User = Depends(require("services:view")), db: DBSession = Depends(get_db)):
+    filters = []
+    if customer_id: filters.append(ServiceRecord.customer_id == customer_id)
+    if vehicle_id: filters.append(ServiceRecord.vehicle_id == vehicle_id)
+    records = db.scalars(select(ServiceRecord).options(selectinload(ServiceRecord.items)).where(*filters).order_by(ServiceRecord.service_date.desc(), ServiceRecord.id.desc()).limit(100)).all()
+    return [{**data(record), "items": [data(item) for item in record.items]} for record in records]
+
+
+@router.post("/pos/checkout", status_code=201)
+def pos_checkout(payload: POSCheckoutIn, user: User = Depends(require("pos:manage")), db: DBSession = Depends(get_db)):
+    customer = db.get(Customer, payload.customer_id)
+    if not customer: raise HTTPException(404, "Customer not found")
+    vehicle = db.get(Vehicle, payload.vehicle_id) if payload.vehicle_id else None
+    if payload.vehicle_id and (not vehicle or vehicle.customer_id != customer.id): raise HTTPException(422, "Vehicle does not belong to the selected customer")
+    if any(line.item_type == "service" for line in payload.lines) and not vehicle: raise HTTPException(422, "Select a customer vehicle for workshop services")
+    subtotal = sum(line.quantity * line.unit_price_cents for line in payload.lines)
+    total = max(0, subtotal + payload.service_fee_cents - payload.discount_cents)
+    if payload.payment_amount_cents > total: raise HTTPException(409, "Payment exceeds invoice total")
+    order = SalesOrder(number=sequence(db, "order", "SO"), customer_id=customer.id, vehicle_id=vehicle.id if vehicle else None, status="Fulfilled", discount_cents=payload.discount_cents, additional_charges_cents=payload.service_fee_cents, created_by=user.id)
+    db.add(order); db.flush()
+    order_lines: list[tuple[POSLineIn, SalesOrderItem]] = []
+    for line in payload.lines:
+        part = db.scalar(select(Part).where(Part.id == line.part_id).with_for_update()) if line.part_id else None
+        service = db.get(Service, line.service_id) if line.service_id else None
+        if line.item_type == "part" and not part: raise HTTPException(404, f"Part not found: {line.description}")
+        if line.item_type == "service" and not service: raise HTTPException(404, f"Service not found: {line.description}")
+        if part:
+            if part.physical_qty - part.reserved_qty < line.quantity: raise HTTPException(409, f"Insufficient available stock for {part.name}")
+            apply_inventory_movement(db, user, part, "issue", line.quantity, reference_type="pos", reference_id=order.id, document_reference=order.number, notes=f"POS issue for {order.number}")
+        order_item = SalesOrderItem(part_id=part.id if part else None, service_id=service.id if service else None, description=line.description, quantity=line.quantity, unit_price_cents=line.unit_price_cents, cost_cents=part.purchase_cost_cents if part else 0, fulfilled_qty=line.quantity)
+        order.items.append(order_item); order_lines.append((line, order_item))
+    db.flush()
+    invoice = Invoice(number=sequence(db, "invoice", "INV"), order_id=order.id, customer_id=customer.id, total_cents=total, paid_cents=payload.payment_amount_cents, status="Paid" if payload.payment_amount_cents == total else "Partially Paid" if payload.payment_amount_cents else "Unpaid")
+    invoice.items = [InvoiceItem(order_item_id=order_item.id, part_id=order_item.part_id, service_id=order_item.service_id, description=line.description, quantity=line.quantity, unit_price_cents=line.unit_price_cents) for line, order_item in order_lines]
+    db.add(invoice); db.flush()
+    if payload.payment_amount_cents:
+        db.add(Payment(invoice_id=invoice.id, amount_cents=payload.payment_amount_cents, method=payload.payment_method, reference=payload.payment_reference, recorded_by=user.id))
+    service_record = None
+    if vehicle and (any(line.item_type == "service" for line in payload.lines) or payload.service_fee_cents or payload.notes):
+        service_record = ServiceRecord(number=sequence(db, "service_record", "JOB"), customer_id=customer.id, vehicle_id=vehicle.id, invoice_id=invoice.id, service_date=payload.service_date, odometer_km=payload.odometer_km, technician=payload.technician, next_service_date=payload.next_service_date, next_service_km=payload.next_service_km, notes=payload.notes, created_by=user.id)
+        service_record.items = [ServiceRecordItem(service_id=line.service_id, part_id=line.part_id, description=line.description, quantity=line.quantity, unit_price_cents=line.unit_price_cents) for line in payload.lines]
+        if payload.service_fee_cents: service_record.items.append(ServiceRecordItem(description="Workshop service fee", quantity=1, unit_price_cents=payload.service_fee_cents))
+        db.add(service_record)
+        if payload.odometer_km is not None: vehicle.mileage_km = max(vehicle.mileage_km or 0, payload.odometer_km)
+    audit(db, user, "pos.checkout", "invoice", invoice.id, f"order={order.number}; total_cents={total}"); db.commit()
+    return {"invoice": data(invoice), "order": data(order), "service_record": data(service_record) if service_record else None, "balance_cents": total - payload.payment_amount_cents}
+
+
 @router.post("/inventory/movements", status_code=201)
 def inventory_move(payload: MovementIn, user: User = Depends(require("inventory:manage")), db: DBSession = Depends(get_db)):
     part = db.scalar(select(Part).where(Part.id == payload.part_id).with_for_update())
@@ -405,6 +484,7 @@ def inventory_move(payload: MovementIn, user: User = Depends(require("inventory:
     movement = apply_inventory_movement(db, user, part, payload.movement_type, payload.quantity,
         counted_quantity=payload.counted_quantity, movement_date=payload.movement_date,
         supplier_id=payload.supplier_id, unit_cost_cents=payload.unit_cost_cents,
+        overhead_cost_cents=payload.overhead_cost_cents,
         document_reference=payload.document_reference, batch_number=payload.batch_number,
         location=payload.location, notes=payload.notes)
     db.flush(); audit(db, user, f"inventory.{payload.movement_type}", "part", part.id, f"movement={movement.number}; delta={movement.quantity_delta}; value={movement.total_cost_cents}"); db.commit()
@@ -440,6 +520,8 @@ def inventory_overview(q: str | None = None, user: User = Depends(require("inven
             "reserved_units": sum(part.reserved_qty for part in all_parts),
             "available_units": sum(part.physical_qty - part.reserved_qty for part in all_parts),
             "stock_value_cents": sum(part.physical_qty * part.purchase_cost_cents for part in all_parts),
+            "retail_value_cents": sum(part.physical_qty * part.selling_price_cents for part in all_parts),
+            "potential_margin_cents": sum(part.physical_qty * max(0, part.selling_price_cents - part.purchase_cost_cents) for part in all_parts),
             "low_stock_items": sum(1 for part in all_parts if part.physical_qty - part.reserved_qty <= part.reorder_level),
         },
         "items": [inventory_part_data(part) for part in parts],
@@ -511,7 +593,9 @@ def quotation_create(payload: QuotationIn, user: User = Depends(require("quotati
     quotation.items = []
     for line in payload.items:
         part = db.get(Part, line.part_id) if line.part_id else None
+        service = db.get(Service, line.service_id) if line.service_id else None
         supplier = db.get(Supplier, line.supplier_id) if line.supplier_id else None
+        if line.service_id and not service: raise HTTPException(404, "Service not found")
         if line.supplier_id and not supplier: raise HTTPException(404, "Allocated supplier not found")
         values = line.model_dump()
         if values["unit_cost_cents"] == 0 and part: values["unit_cost_cents"] = part.purchase_cost_cents
@@ -555,7 +639,7 @@ def quotation_convert(quotation_id: int, user: User = Depends(require("orders:ma
         part = db.get(Part, item.part_id) if item.part_id else None
         if part and part.physical_qty - part.reserved_qty >= item.quantity:
             apply_inventory_movement(db, user, part, "reserve", item.quantity, reference_type="order", reference_id=order.id, document_reference=order.number, notes=f"Reserved for {order.number}")
-        order.items.append(SalesOrderItem(part_id=item.part_id, supplier_id=item.supplier_id, supplier_reference=item.supplier_reference, description=item.description, quantity=item.quantity, unit_price_cents=item.unit_price_cents, cost_cents=item.unit_cost_cents or (part.purchase_cost_cents if part else 0)))
+        order.items.append(SalesOrderItem(part_id=item.part_id, service_id=item.service_id, supplier_id=item.supplier_id, supplier_reference=item.supplier_reference, description=item.description, quantity=item.quantity, unit_price_cents=item.unit_price_cents, cost_cents=item.unit_cost_cents or (part.purchase_cost_cents if part else 0)))
     quotation.status = "Converted"; db.flush(); audit(db, user, "quotation.convert", "order", order.id); db.commit()
     return data(order)
 
@@ -589,7 +673,7 @@ def generate_invoice(order_id: int, user: User = Depends(require("invoices:manag
     if order.status == "Cancelled": raise HTTPException(409, "Cancelled orders cannot be invoiced")
     invoice_total = max(0, sum(x.quantity * x.unit_price_cents for x in order.items) - order.discount_cents + order.additional_charges_cents)
     invoice = Invoice(number=sequence(db, "invoice", "INV"), order_id=order.id, customer_id=order.customer_id, total_cents=invoice_total)
-    invoice.items = [InvoiceItem(order_item_id=x.id, part_id=x.part_id, description=x.description, quantity=x.quantity, unit_price_cents=x.unit_price_cents) for x in order.items]
+    invoice.items = [InvoiceItem(order_item_id=x.id, part_id=x.part_id, service_id=x.service_id, description=x.description, quantity=x.quantity, unit_price_cents=x.unit_price_cents) for x in order.items]
     db.add(invoice); db.flush(); audit(db, user, "invoice.create", "invoice", invoice.id); db.commit()
     return data(invoice)
 
@@ -632,7 +716,8 @@ def create_document_share(db: DBSession, kind: str, document_id: int, expires_da
     raw_token = secrets.token_urlsafe(32)
     share = DocumentShare(document_type=kind, document_id=document_id, token_hash=hashlib.sha256(raw_token.encode()).hexdigest(), expires_at=datetime.now(timezone.utc) + timedelta(days=expires_days), created_by=user.id)
     db.add(share); db.flush(); audit(db, user, "document.share", kind, document_id, f"expires_days={expires_days}"); db.commit()
-    return {"url": f"{str(request.base_url).rstrip('/')}/share/{raw_token}", "expires_at": share.expires_at}
+    base_url = (settings.public_base_url or str(request.base_url)).rstrip("/")
+    return {"url": f"{base_url}/share/{raw_token}", "expires_at": share.expires_at}
 
 
 @router.post("/quotations/{quotation_id}/share", status_code=201)
@@ -658,23 +743,69 @@ def public_document(token: str, db: DBSession = Depends(get_db)):
     return result
 
 
-def invoice_pdf(invoice: Invoice, customer: Customer, items: list[InvoiceItem]) -> bytes:
-    stream = BytesIO(); doc = SimpleDocTemplate(stream, pagesize=A4, rightMargin=18*mm, leftMargin=18*mm, topMargin=18*mm, bottomMargin=18*mm)
-    styles = getSampleStyleSheet(); story = [Paragraph("<b>EMOTO</b> · German Spare Parts", styles["Title"]), Paragraph(f"Invoice {invoice.number}", styles["Heading2"]), Spacer(1, 5*mm), Paragraph(f"Bill to: <b>{customer.full_name}</b><br/>{customer.address or ''}<br/>Issue date: {invoice.issue_date.isoformat()}", styles["BodyText"]), Spacer(1, 6*mm)]
-    rows = [["Description", "Qty", "Unit price", "Amount"]] + [[x.description, str(x.quantity), f"LKR {x.unit_price_cents/100:,.2f}", f"LKR {x.quantity*x.unit_price_cents/100:,.2f}"] for x in items]
-    rows += [["", "", "Total", f"LKR {invoice.total_cents/100:,.2f}"], ["", "", "Paid", f"LKR {invoice.paid_cents/100:,.2f}"], ["", "", "Balance", f"LKR {(invoice.total_cents-invoice.paid_cents)/100:,.2f}"]]
-    table = Table(rows, colWidths=[85*mm, 18*mm, 32*mm, 35*mm], repeatRows=1)
-    table.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,0), colors.HexColor("#191919")), ("TEXTCOLOR", (0,0), (-1,0), colors.white), ("GRID", (0,0), (-1,-1), .25, colors.HexColor("#cccccc")), ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"), ("ALIGN", (1,1), (-1,-1), "RIGHT"), ("VALIGN", (0,0), (-1,-1), "TOP"), ("ROWBACKGROUNDS", (0,1), (-1,-4), [colors.white, colors.HexColor("#f7f7f7")]), ("TOPPADDING", (0,0), (-1,-1), 7), ("BOTTOMPADDING", (0,0), (-1,-1), 7)]))
-    story += [table, Spacer(1, 12*mm), Paragraph("Thank you for your business.<br/><br/>Authorized signature: ____________________", styles["BodyText"])]
-    doc.build(story); return stream.getvalue()
+def verified_share_url(db: DBSession, request: Request, kind: str, document_id: int, token: str | None) -> str | None:
+    if not token: return None
+    share = db.scalar(select(DocumentShare).where(DocumentShare.token_hash == hashlib.sha256(token.encode()).hexdigest(), DocumentShare.document_type == kind, DocumentShare.document_id == document_id, DocumentShare.revoked_at.is_(None)))
+    if not share: raise HTTPException(422, "The QR link is invalid for this document")
+    expires = share.expires_at
+    if expires and expires.tzinfo is None: expires = expires.replace(tzinfo=timezone.utc)
+    if expires and expires <= datetime.now(timezone.utc): raise HTTPException(410, "The QR link has expired")
+    base_url = (settings.public_base_url or str(request.base_url)).rstrip("/")
+    return f"{base_url}/share/{token}"
+
+
+def document_pdf(document: dict, qr_url: str | None = None) -> bytes:
+    stream = BytesIO(); pdf = SimpleDocTemplate(stream, pagesize=A4, rightMargin=16*mm, leftMargin=16*mm, topMargin=15*mm, bottomMargin=15*mm, title=f"{document['number']} - EMOTO")
+    styles = getSampleStyleSheet(); green = colors.HexColor("#249b68"); dark = colors.HexColor("#171717"); line = colors.HexColor("#dddddd")
+    title = "INVOICE" if document["type"] == "invoice" else "QUOTATION"
+    brand = Paragraph("<font size='18'><b>EMOTO</b></font><br/><font color='#249b68' size='8'>BMW SPARE PARTS</font>", styles["BodyText"])
+    meta = Paragraph(f"<font size='16'><b>{title}</b></font><br/><font size='9' color='#666666'>{document['number']}<br/>{document['date']}</font>", styles["BodyText"])
+    header = Table([[brand, meta]], colWidths=[115*mm, 62*mm]); header.setStyle(TableStyle([("ALIGN", (1,0), (1,0), "RIGHT"), ("VALIGN", (0,0), (-1,-1), "TOP"), ("BOTTOMPADDING", (0,0), (-1,-1), 8*mm)]))
+    safe = lambda value: escape(str(value or ""))
+    customer = document["customer"]; vehicle = document.get("vehicle")
+    customer_text = f"<font size='8' color='#777777'>CUSTOMER</font><br/><b>{safe(customer.get('name'))}</b><br/>{safe(customer.get('business_name'))}<br/>{safe(customer.get('phone'))}<br/>{safe(customer.get('address'))}"
+    vehicle_text = "<font size='8' color='#777777'>VEHICLE</font><br/>Not specified"
+    if vehicle:
+        vehicle_details = " / ".join(safe(x) for x in [vehicle.get("year"), vehicle.get("chassis_code"), vehicle.get("engine")] if x)
+        vehicle_text = f"<font size='8' color='#777777'>VEHICLE</font><br/><b>BMW {safe(vehicle.get('model'))}</b><br/>{safe(vehicle.get('registration_number'))}<br/>{vehicle_details}"
+    date_label = "ISSUE DATE" if document["type"] == "invoice" else "QUOTE DATE"
+    date_text = f"<font size='8' color='#777777'>{date_label}</font><br/><b>{document['date']}</b>"
+    if document.get("expiry_date"): date_text += f"<br/><br/><font size='8' color='#777777'>VALID UNTIL</font><br/><b>{document['expiry_date']}</b>"
+    parties = Table([[Paragraph(customer_text, styles["BodyText"]), Paragraph(vehicle_text, styles["BodyText"]), Paragraph(date_text, styles["BodyText"])]], colWidths=[72*mm, 65*mm, 40*mm])
+    parties.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,-1), colors.HexColor("#f5f7f6")), ("BOX", (0,0), (-1,-1), .5, line), ("INNERGRID", (0,0), (-1,-1), .5, line), ("VALIGN", (0,0), (-1,-1), "TOP"), ("LEFTPADDING", (0,0), (-1,-1), 10), ("RIGHTPADDING", (0,0), (-1,-1), 10), ("TOPPADDING", (0,0), (-1,-1), 10), ("BOTTOMPADDING", (0,0), (-1,-1), 10)]))
+    rows = [["Description", "Qty", "Unit price", "Amount"]]
+    for item in document["items"]:
+        description = safe(item["description"]) + (f"\n{safe(item['warranty'])}" if item.get("warranty") else "")
+        rows.append([description, str(item["quantity"]), f"LKR {item['unit_price_cents']/100:,.2f}", f"LKR {item['amount_cents']/100:,.2f}"])
+    items = Table(rows, colWidths=[92*mm, 16*mm, 34*mm, 35*mm], repeatRows=1)
+    items.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,0), dark), ("TEXTCOLOR", (0,0), (-1,0), colors.white), ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"), ("FONTSIZE", (0,0), (-1,-1), 8), ("ALIGN", (1,1), (-1,-1), "RIGHT"), ("GRID", (0,0), (-1,-1), .35, line), ("VALIGN", (0,0), (-1,-1), "TOP"), ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#fafafa")]), ("TOPPADDING", (0,0), (-1,-1), 8), ("BOTTOMPADDING", (0,0), (-1,-1), 8)]))
+    totals = []
+    if document.get("discount_cents"): totals.append(["Discount", f"- LKR {document['discount_cents']/100:,.2f}"])
+    if document.get("additional_charges_cents"): totals.append(["Additional charges", f"LKR {document['additional_charges_cents']/100:,.2f}"])
+    totals.append(["TOTAL", f"LKR {document['total_cents']/100:,.2f}"])
+    if document["type"] == "invoice": totals += [["Paid", f"LKR {document['paid_cents']/100:,.2f}"], ["BALANCE DUE", f"LKR {document['balance_cents']/100:,.2f}"]]
+    total_table = Table(totals, colWidths=[42*mm, 43*mm], hAlign="RIGHT"); total_table.setStyle(TableStyle([("ALIGN", (1,0), (-1,-1), "RIGHT"), ("FONTNAME", (0,-1), (-1,-1), "Helvetica-Bold"), ("FONTSIZE", (0,0), (-1,-1), 9), ("LINEABOVE", (0,-1), (-1,-1), .8, dark), ("TOPPADDING", (0,0), (-1,-1), 6), ("BOTTOMPADDING", (0,0), (-1,-1), 6)]))
+    story = [header, parties, Spacer(1, 7*mm), items, Spacer(1, 5*mm), total_table]
+    if document.get("notes"): story += [Spacer(1, 6*mm), Paragraph(f"<font size='8' color='#777777'>NOTES</font><br/>{safe(document['notes'])}", styles["BodyText"])]
+    if qr_url:
+        widget = qr.QrCodeWidget(qr_url); bounds = widget.getBounds(); size = 27*mm
+        drawing = Drawing(size, size, transform=[size/(bounds[2]-bounds[0]), 0, 0, size/(bounds[3]-bounds[1]), 0, 0]); drawing.add(widget)
+        qr_block = Table([[drawing, Paragraph("<b>Scan to view this secure digital document</b><br/><font size='8' color='#666666'>The QR code opens the customer copy. Supplier and purchase-cost information is never included.</font>", styles["BodyText"])]], colWidths=[32*mm, 120*mm], hAlign="LEFT")
+        qr_block.setStyle(TableStyle([("VALIGN", (0,0), (-1,-1), "MIDDLE"), ("BOX", (0,0), (-1,-1), .5, green), ("LEFTPADDING", (0,0), (-1,-1), 8), ("RIGHTPADDING", (0,0), (-1,-1), 8), ("TOPPADDING", (0,0), (-1,-1), 8), ("BOTTOMPADDING", (0,0), (-1,-1), 8)])); story += [Spacer(1, 8*mm), qr_block]
+    story += [Spacer(1, 9*mm), Paragraph("Thank you for choosing EMOTO BMW Spare Parts.<br/><br/>Authorized signature: ______________________________", styles["BodyText"])]
+    pdf.build(story); return stream.getvalue()
+
+
+@router.get("/quotations/{quotation_id}/pdf")
+def download_quotation(quotation_id: int, request: Request, share_token: str | None = Query(None, max_length=200), user: User = Depends(require("quotations:manage")), db: DBSession = Depends(get_db)):
+    document = customer_document(db, "quotation", quotation_id); qr_url = verified_share_url(db, request, "quotation", quotation_id, share_token)
+    return StreamingResponse(BytesIO(document_pdf(document, qr_url)), media_type="application/pdf", headers={"Content-Disposition": f'inline; filename="{document["number"]}.pdf"'})
 
 
 @router.get("/invoices/{invoice_id}/pdf")
-def download_invoice(invoice_id: int, user: User = Depends(require("invoices:view")), db: DBSession = Depends(get_db)):
-    invoice = db.scalar(select(Invoice).options(selectinload(Invoice.items)).where(Invoice.id == invoice_id))
-    if not invoice: raise HTTPException(404, "Invoice not found")
-    customer = db.get(Customer, invoice.customer_id)
-    return StreamingResponse(BytesIO(invoice_pdf(invoice, customer, invoice.items)), media_type="application/pdf", headers={"Content-Disposition": f'inline; filename="{invoice.number}.pdf"'})
+def download_invoice(invoice_id: int, request: Request, share_token: str | None = Query(None, max_length=200), user: User = Depends(require("invoices:view")), db: DBSession = Depends(get_db)):
+    document = customer_document(db, "invoice", invoice_id); qr_url = verified_share_url(db, request, "invoice", invoice_id, share_token)
+    return StreamingResponse(BytesIO(document_pdf(document, qr_url)), media_type="application/pdf", headers={"Content-Disposition": f'inline; filename="{document["number"]}.pdf"'})
 
 
 @router.post("/invoices/{invoice_id}/warranties", status_code=201)
@@ -708,6 +839,26 @@ def warranty_claim(warranty_id: int, payload: ClaimIn, user: User = Depends(requ
     if not warranty: raise HTTPException(404, "Warranty not found")
     claim = WarrantyClaim(warranty_id=warranty_id, details=payload.details); warranty.status = "Claim Open"
     db.add(claim); db.flush(); audit(db, user, "warranty.claim", "warranty_claim", claim.id); db.commit(); return data(claim)
+
+
+@router.get("/reports/inventory/pdf")
+def inventory_report_pdf(user: User = Depends(require("inventory:manage")), db: DBSession = Depends(get_db)):
+    parts = db.scalars(select(Part).order_by(Part.category, Part.name)).all()
+    total_cost = sum(part.physical_qty * part.purchase_cost_cents for part in parts)
+    total_retail = sum(part.physical_qty * part.selling_price_cents for part in parts)
+    low_count = sum(1 for part in parts if part.physical_qty - part.reserved_qty <= part.reorder_level)
+    stream = BytesIO(); pdf = SimpleDocTemplate(stream, pagesize=landscape(A4), rightMargin=12*mm, leftMargin=12*mm, topMargin=12*mm, bottomMargin=12*mm, title="EMOTO Inventory Report")
+    styles = getSampleStyleSheet(); story = [Paragraph("<b>EMOTO</b> · BMW Spare Parts", styles["Title"]), Paragraph(f"Inventory valuation report · {date.today().isoformat()}", styles["Heading2"]), Spacer(1, 4*mm), Paragraph(f"SKUs: <b>{len(parts)}</b> &nbsp;&nbsp; Low stock: <b>{low_count}</b> &nbsp;&nbsp; Cost value: <b>LKR {total_cost/100:,.2f}</b> &nbsp;&nbsp; Retail value: <b>LKR {total_retail/100:,.2f}</b>", styles["BodyText"]), Spacer(1, 5*mm)]
+    rows = [["SKU", "Part", "Fitment", "Location", "Physical", "Reserved", "Available", "Avg. cost", "Stock value", "Reorder"]]
+    for part in parts:
+        available = part.physical_qty - part.reserved_qty
+        target = part.maximum_stock if part.maximum_stock is not None else part.reorder_level + part.reorder_quantity
+        reorder = max(0, target - available) if available <= part.reorder_level else 0
+        rows.append([part.sku, part.name, (part.fitment_notes or "-")[:35], " / ".join(x for x in [part.location, part.storage_bin] if x) or "-", part.physical_qty, part.reserved_qty, available, f"{part.purchase_cost_cents/100:,.2f}", f"{part.physical_qty*part.purchase_cost_cents/100:,.2f}", reorder or "-"])
+    table = Table(rows, colWidths=[25*mm, 43*mm, 50*mm, 35*mm, 18*mm, 18*mm, 18*mm, 25*mm, 28*mm, 18*mm], repeatRows=1)
+    table.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,0), colors.HexColor("#171717")), ("TEXTCOLOR", (0,0), (-1,0), colors.white), ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"), ("FONTSIZE", (0,0), (-1,-1), 7), ("GRID", (0,0), (-1,-1), .3, colors.HexColor("#dddddd")), ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#f7f7f7")]), ("ALIGN", (4,1), (-1,-1), "RIGHT"), ("VALIGN", (0,0), (-1,-1), "TOP"), ("TOPPADDING", (0,0), (-1,-1), 5), ("BOTTOMPADDING", (0,0), (-1,-1), 5)]))
+    story.append(table); pdf.build(story)
+    return StreamingResponse(BytesIO(stream.getvalue()), media_type="application/pdf", headers={"Content-Disposition": f'inline; filename="EMOTO-inventory-{date.today().isoformat()}.pdf"'})
 
 
 @router.get("/reports/financial")

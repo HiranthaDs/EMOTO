@@ -98,6 +98,63 @@ def test_inventory_weighted_cost_snapshots_and_stocktake_protection(admin):
     assert overview.json()["movements"][-1]["supplier_name"] == "Stock Source GmbH"
 
 
+def test_pos_checkout_tracks_landed_cost_stock_payment_and_service_history(admin):
+    profile = post(admin, "/customer-profiles", {
+        "customer": {"full_name": "POS Customer", "phone": "+94771112233"},
+        "vehicle": {"registration_number": "POS-320", "model": "320i", "mileage_km": 50000},
+    }).json()
+    supplier = post(admin, "/suppliers", {"company_name": "POS Parts Supplier"}).json()
+    part = post(admin, "/parts", {
+        "sku": "POS-OIL-001", "name": "BMW engine oil", "fitment_notes": "BMW 3 Series F30",
+        "selling_price_cents": 2500,
+    }).json()
+    service = post(admin, "/services", {
+        "name": "Engine oil change", "category": "Maintenance", "default_fee_cents": 5000,
+        "estimated_minutes": 45, "recommended_interval_km": 10000,
+    })
+    assert service.status_code == 201, service.text
+
+    receipt = post(admin, "/inventory/movements", {
+        "part_id": part["id"], "movement_type": "receive", "quantity": 10,
+        "supplier_id": supplier["id"], "unit_cost_cents": 1000, "overhead_cost_cents": 5000,
+        "document_reference": "SUP-INV-100",
+    })
+    assert receipt.status_code == 201, receipt.text
+    assert receipt.json()["movement"]["overhead_cost_cents"] == 5000
+    assert receipt.json()["movement"]["landed_unit_cost_cents"] == 1500
+    assert receipt.json()["movement"]["total_cost_cents"] == 15000
+    assert receipt.json()["part"]["purchase_cost_cents"] == 1500
+
+    checkout = post(admin, "/pos/checkout", {
+        "customer_id": profile["customer"]["id"],
+        "vehicle_id": profile["vehicle"]["id"],
+        "lines": [
+            {"item_type": "part", "part_id": part["id"], "description": "BMW engine oil", "quantity": 2, "unit_price_cents": 2500},
+            {"item_type": "service", "service_id": service.json()["id"], "description": "Engine oil change", "quantity": 1, "unit_price_cents": 5000},
+        ],
+        "service_fee_cents": 1000, "discount_cents": 500, "payment_amount_cents": 10500,
+        "payment_method": "Cash", "service_date": "2026-10-22", "odometer_km": 51000,
+        "technician": "Workshop A", "next_service_date": "2027-04-22", "next_service_km": 61000,
+        "notes": "Oil and filter maintenance",
+    })
+    assert checkout.status_code == 201, checkout.text
+    assert checkout.json()["invoice"]["total_cents"] == 10500
+    assert checkout.json()["invoice"]["paid_cents"] == 10500
+    assert checkout.json()["invoice"]["status"] == "Paid"
+    assert checkout.json()["balance_cents"] == 0
+
+    inventory = admin["client"].get("/api/v1/inventory/overview").json()
+    stocked = next(item for item in inventory["items"] if item["id"] == part["id"])
+    assert stocked["physical_qty"] == 8
+    assert any(movement["reference_type"] == "pos" for movement in inventory["movements"])
+
+    customer = admin["client"].get(f"/api/v1/customers/{profile['customer']['id']}").json()
+    assert customer["vehicles"][0]["mileage_km"] == 51000
+    assert customer["service_history"][0]["technician"] == "Workshop A"
+    assert len(customer["service_history"][0]["items"]) == 3
+    assert admin["client"].get("/api/v1/reports/inventory/pdf").headers["content-type"] == "application/pdf"
+
+
 def test_backup_is_valid_sqlite(admin):
     backup = post(admin, "/admin/backups")
     assert backup.status_code == 201
@@ -202,6 +259,11 @@ def test_customer_vehicle_supplier_history_and_public_quote(admin):
     assert public.json()["items"][0]["amount_cents"] == 2400000
     assert "supplier" not in public.text.lower()
     assert "unit_cost_cents" not in public.text
+    printable = admin["client"].get(f"/api/v1/quotations/{quote.json()['id']}/pdf?share_token={token}")
+    assert printable.status_code == 200, printable.text
+    assert printable.headers["content-type"] == "application/pdf"
+    assert printable.content.startswith(b"%PDF-")
+    assert len(printable.content) > 3000
 
 
 def test_finance_report_separates_sales_cash_and_manual_entries(admin):

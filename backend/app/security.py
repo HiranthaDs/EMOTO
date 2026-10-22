@@ -14,10 +14,10 @@ password_hash = PasswordHash.recommended()
 
 ROLE_PERMISSIONS = {
     "Super Admin": {"*"},
-    "Sales": {"dashboard:view", "customers:manage", "vehicles:manage", "parts:view", "quotations:manage", "orders:manage", "invoices:view", "warranties:view"},
-    "Purchasing": {"dashboard:view", "suppliers:manage", "rfqs:manage", "parts:view", "costs:view"},
-    "Inventory": {"dashboard:view", "parts:manage", "inventory:manage", "orders:view", "warranties:manage", "costs:view"},
-    "Accounts": {"dashboard:view", "customers:view", "orders:view", "invoices:manage", "payments:manage", "reports:view", "finance:manage", "costs:view"},
+    "Sales": {"dashboard:view", "customers:manage", "vehicles:manage", "parts:view", "services:manage", "pos:manage", "quotations:manage", "orders:manage", "invoices:view", "warranties:view"},
+    "Purchasing": {"dashboard:view", "suppliers:manage", "rfqs:manage", "parts:view", "services:view", "costs:view"},
+    "Inventory": {"dashboard:view", "parts:manage", "inventory:manage", "services:view", "orders:view", "warranties:manage", "costs:view"},
+    "Accounts": {"dashboard:view", "customers:view", "services:view", "orders:view", "invoices:manage", "payments:manage", "reports:view", "finance:manage", "costs:view"},
 }
 
 

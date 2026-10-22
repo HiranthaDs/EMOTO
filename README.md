@@ -32,7 +32,7 @@ Use different random values for `SESSION_SECRET` and `BOOTSTRAP_TOKEN`, then run
 .\run_local.ps1
 ```
 
-Open `http://localhost:5173`. On a new database, the app displays first-run setup. Enter the same one-time `BOOTSTRAP_TOKEN` and create a password of at least 12 characters. Setup is permanently disabled after the first user exists.
+Open `http://localhost:10000`. The local runner applies database migrations, compiles the React interface, and starts the Python/FastAPI server; Docker is not required. On a new database, the app displays first-run setup. Enter the same one-time `BOOTSTRAP_TOKEN` and create a password of at least 12 characters. Setup is permanently disabled after the first user exists.
 
 ## Tests and production build
 

@@ -138,6 +138,8 @@ class InventoryMovement(Base):
     reserved_before: Mapped[int] = mapped_column(Integer, default=0)
     reserved_after: Mapped[int] = mapped_column(Integer, default=0)
     unit_cost_cents: Mapped[int] = mapped_column(Integer, default=0)
+    overhead_cost_cents: Mapped[int] = mapped_column(Integer, default=0)
+    landed_unit_cost_cents: Mapped[int] = mapped_column(Integer, default=0)
     total_cost_cents: Mapped[int] = mapped_column(Integer, default=0)
     stock_value_before_cents: Mapped[int] = mapped_column(Integer, default=0)
     stock_value_after_cents: Mapped[int] = mapped_column(Integer, default=0)
@@ -234,6 +236,7 @@ class QuotationItem(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     quotation_id: Mapped[int] = mapped_column(ForeignKey("customer_quotations.id", ondelete="CASCADE"), index=True)
     part_id: Mapped[int | None] = mapped_column(ForeignKey("parts.id"))
+    service_id: Mapped[int | None] = mapped_column(ForeignKey("services.id"))
     supplier_id: Mapped[int | None] = mapped_column(ForeignKey("suppliers.id"), index=True)
     supplier_reference: Mapped[str | None] = mapped_column(String(100))
     description: Mapped[str] = mapped_column(String(255))
@@ -263,6 +266,7 @@ class SalesOrderItem(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     order_id: Mapped[int] = mapped_column(ForeignKey("sales_orders.id", ondelete="CASCADE"), index=True)
     part_id: Mapped[int | None] = mapped_column(ForeignKey("parts.id"))
+    service_id: Mapped[int | None] = mapped_column(ForeignKey("services.id"))
     supplier_id: Mapped[int | None] = mapped_column(ForeignKey("suppliers.id"), index=True)
     supplier_reference: Mapped[str | None] = mapped_column(String(100))
     description: Mapped[str] = mapped_column(String(255))
@@ -292,6 +296,7 @@ class InvoiceItem(Base):
     invoice_id: Mapped[int] = mapped_column(ForeignKey("invoices.id", ondelete="CASCADE"), index=True)
     order_item_id: Mapped[int] = mapped_column(ForeignKey("sales_order_items.id"))
     part_id: Mapped[int | None] = mapped_column(ForeignKey("parts.id"))
+    service_id: Mapped[int | None] = mapped_column(ForeignKey("services.id"))
     description: Mapped[str] = mapped_column(String(255))
     quantity: Mapped[int] = mapped_column(Integer)
     unit_price_cents: Mapped[int] = mapped_column(Integer)
@@ -306,6 +311,48 @@ class Payment(Base):
     reference: Mapped[str | None] = mapped_column(String(100))
     paid_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     recorded_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
+
+
+class Service(Base, TimestampMixin):
+    __tablename__ = "services"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(160), index=True)
+    category: Mapped[str | None] = mapped_column(String(80), index=True)
+    description: Mapped[str | None] = mapped_column(Text)
+    default_fee_cents: Mapped[int] = mapped_column(Integer, default=0)
+    estimated_minutes: Mapped[int | None] = mapped_column(Integer)
+    recommended_interval_km: Mapped[int | None] = mapped_column(Integer)
+    recommended_interval_months: Mapped[int | None] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(30), default="Active", index=True)
+
+
+class ServiceRecord(Base, TimestampMixin):
+    __tablename__ = "service_records"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    number: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    customer_id: Mapped[int] = mapped_column(ForeignKey("customers.id"), index=True)
+    vehicle_id: Mapped[int] = mapped_column(ForeignKey("vehicles.id"), index=True)
+    invoice_id: Mapped[int | None] = mapped_column(ForeignKey("invoices.id"), index=True)
+    service_date: Mapped[date] = mapped_column(Date, default=date.today, index=True)
+    odometer_km: Mapped[int | None] = mapped_column(Integer)
+    technician: Mapped[str | None] = mapped_column(String(120))
+    next_service_date: Mapped[date | None] = mapped_column(Date)
+    next_service_km: Mapped[int | None] = mapped_column(Integer)
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    items: Mapped[list[ServiceRecordItem]] = relationship(cascade="all, delete-orphan")
+
+
+class ServiceRecordItem(Base):
+    __tablename__ = "service_record_items"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    service_record_id: Mapped[int] = mapped_column(ForeignKey("service_records.id", ondelete="CASCADE"), index=True)
+    service_id: Mapped[int | None] = mapped_column(ForeignKey("services.id"))
+    part_id: Mapped[int | None] = mapped_column(ForeignKey("parts.id"))
+    description: Mapped[str] = mapped_column(String(255))
+    quantity: Mapped[int] = mapped_column(Integer, default=1)
+    unit_price_cents: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class FinanceEntry(Base, TimestampMixin):

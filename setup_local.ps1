@@ -27,5 +27,5 @@ Write-Host ''
 Write-Host 'Setup complete.' -ForegroundColor Green
 Write-Host '1. Edit .env and set random SESSION_SECRET and BOOTSTRAP_TOKEN values.'
 Write-Host '2. Run .\run_local.ps1'
-Write-Host '3. Open http://localhost:5173 and create the first administrator.'
+Write-Host '3. Open http://localhost:10000 and create the first administrator.'
 

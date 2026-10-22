@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     bootstrap_token: str | None = None
     session_hours: int = 12
     allowed_origins: str = "http://localhost:5173,http://localhost:10000"
+    public_base_url: str | None = None
 
     model_config = SettingsConfigDict(env_file=(".env", "../.env"), extra="ignore")
 

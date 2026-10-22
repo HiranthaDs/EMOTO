@@ -113,6 +113,7 @@ class MovementIn(BaseModel):
     movement_date: date = Field(default_factory=date.today)
     supplier_id: int | None = None
     unit_cost_cents: int | None = Field(None, ge=0)
+    overhead_cost_cents: int = Field(0, ge=0)
     document_reference: str | None = Field(None, max_length=100)
     batch_number: str | None = Field(None, max_length=100)
     location: str | None = Field(None, max_length=100)
@@ -171,6 +172,7 @@ class SupplierQuoteIn(BaseModel):
 
 class LineIn(BaseModel):
     part_id: int | None = None
+    service_id: int | None = None
     supplier_id: int | None = None
     supplier_reference: str | None = None
     description: str
@@ -194,6 +196,55 @@ class PaymentIn(BaseModel):
     amount_cents: int = Field(gt=0)
     method: str
     reference: str | None = None
+
+
+class ServiceIn(BaseModel):
+    name: str = Field(min_length=2, max_length=160)
+    category: str | None = None
+    description: str | None = None
+    default_fee_cents: int = Field(0, ge=0)
+    estimated_minutes: int | None = Field(None, ge=0)
+    recommended_interval_km: int | None = Field(None, ge=0)
+    recommended_interval_months: int | None = Field(None, ge=0, le=120)
+    status: str = "Active"
+
+
+class POSLineIn(BaseModel):
+    item_type: str
+    part_id: int | None = None
+    service_id: int | None = None
+    description: str = Field(min_length=1, max_length=255)
+    quantity: int = Field(gt=0)
+    unit_price_cents: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_source(self):
+        if self.item_type not in {"part", "service", "manual"}:
+            raise ValueError("Item type must be part, service, or manual")
+        if self.item_type == "part" and (not self.part_id or self.service_id):
+            raise ValueError("A part line must reference only one part")
+        if self.item_type == "service" and (not self.service_id or self.part_id):
+            raise ValueError("A service line must reference only one service")
+        if self.item_type == "manual" and (self.part_id or self.service_id):
+            raise ValueError("A manual line cannot reference a catalog item")
+        return self
+
+
+class POSCheckoutIn(BaseModel):
+    customer_id: int
+    vehicle_id: int | None = None
+    lines: list[POSLineIn] = Field(min_length=1)
+    service_fee_cents: int = Field(0, ge=0)
+    discount_cents: int = Field(0, ge=0)
+    payment_amount_cents: int = Field(0, ge=0)
+    payment_method: str = "Cash"
+    payment_reference: str | None = None
+    service_date: date = Field(default_factory=date.today)
+    odometer_km: int | None = Field(None, ge=0)
+    technician: str | None = None
+    next_service_date: date | None = None
+    next_service_km: int | None = Field(None, ge=0)
+    notes: str | None = None
 
 
 class VehicleProfileIn(BaseModel):
