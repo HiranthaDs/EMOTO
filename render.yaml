@@ -15,8 +15,6 @@ services:
         value: /var/data
       - key: SESSION_SECRET
         generateValue: true
-      - key: BOOTSTRAP_TOKEN
-        sync: false
       - key: SESSION_HOURS
         value: "12"
     disk:

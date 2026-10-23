@@ -10,7 +10,7 @@ export default defineConfig({
   webServer: {
     command: '..\\.venv\\Scripts\\python.exe -m app.migrate && ..\\.venv\\Scripts\\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 10001',
     cwd: '../backend',
-    env: { ...process.env, DATA_DIR: 'data/e2e', BOOTSTRAP_TOKEN: 'e2e-bootstrap-token', SESSION_SECRET: 'e2e-session-secret-long-enough-for-testing' },
+    env: { ...process.env, DATA_DIR: 'data/e2e', INITIAL_ADMIN_EMAIL: 'admin@gmail.com', INITIAL_ADMIN_PASSWORD: 'admin@123', SESSION_SECRET: 'e2e-session-secret-long-enough-for-testing' },
     url: 'http://127.0.0.1:10001/health',
     reuseExistingServer: false,
     timeout: 30_000,

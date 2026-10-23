@@ -26,13 +26,13 @@ Edit `.env`. Generate secrets, for example:
 python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
-Use different random values for `SESSION_SECRET` and `BOOTSTRAP_TOKEN`, then run:
+Set a random value for `SESSION_SECRET`, then run:
 
 ```powershell
 .\run_local.ps1
 ```
 
-Open `http://localhost:10000`. The local runner applies database migrations, compiles the React interface, and starts the Python/FastAPI server; Docker is not required. On a new database, the app displays first-run setup. Enter the same one-time `BOOTSTRAP_TOKEN` and create a password of at least 12 characters. Setup is permanently disabled after the first user exists.
+Open `http://localhost:10000`. The local runner applies database migrations, creates the initial Super Admin when the database has no users, compiles the React interface, and starts the Python/FastAPI server; Docker is not required. Sign in with `admin@gmail.com` and `admin@123`.
 
 ## Tests and production build
 
@@ -55,9 +55,9 @@ This repository is configured as one FastAPI Function that also serves the compi
 2. In Vercel, import the repository into a **Hobby** project. Keep the project root at the repository root; `vercel.json` selects FastAPI and contains the build settings.
 3. In **Project > Settings > Environment Variables**, add the following to Production and Preview:
    - `SESSION_SECRET`: a random value of at least 32 characters.
-   - `BOOTSTRAP_TOKEN`: a different random one-time setup value.
+   - `INITIAL_ADMIN_EMAIL`, `INITIAL_ADMIN_PASSWORD`, and `INITIAL_ADMIN_NAME`: optional overrides used only when the database has no users.
    - `PUBLIC_BASE_URL`: optional for previews; for production set it to the final `https://...vercel.app` or custom-domain URL so PDFs and QR links use that hostname.
-4. Deploy, open `/health`, then open the root URL and create the administrator with `BOOTSTRAP_TOKEN`.
+4. Deploy, open `/health`, then open the root URL and sign in with the configured initial administrator credentials.
 
 Generate secrets locally with:
 
@@ -111,12 +111,17 @@ Create suppliers and catalog parts, receive stock, then build customer and vehic
 ## Security and operating notes
 
 - Authentication uses Argon2 password hashing and opaque database-backed sessions in HttpOnly cookies.
+- A new empty database receives one initial Super Admin. The initializer never resets or recreates users after the first user exists.
 - Mutations require a session-bound CSRF token; production cookies are Secure and SameSite=Lax.
 - Login attempts are limited per email/IP in the single application process.
 - Every API route performs server-side permission checks. Restricted purchase costs and financial reports are filtered server-side.
 - Uploads are size/type/signature checked, randomized on disk, and only downloaded through authenticated endpoints.
 - Never expose `DATA_DIR`, upload paths, the database, WAL files, backups, `.env`, or deployment secrets through static hosting.
+- Keep the source repository private and grant repository and hosting access only to named maintainers. Production disables the API schema and documentation, sends no-index/no-cache headers, and publishes a deny-all `robots.txt` including the OpenAI, Anthropic, and Google AI crawler tokens.
+- Browser-delivered HTML, CSS, and JavaScript can always be inspected. Keep proprietary calculations, authorization, inventory mutation, pricing rules, and other business logic on the server; minification and crawler rules are deterrents, not access controls.
 - All displayed timestamps are formatted for Asia/Colombo. The database stores UTC timestamps.
+
+The repository is proprietary software; see [PROPRIETARY-LICENSE.md](PROPRIETARY-LICENSE.md). Replace `EMOTO` in that notice with the exact legal owner name if the software is owned by a registered person or company under another name.
 
 ## Verified status
 

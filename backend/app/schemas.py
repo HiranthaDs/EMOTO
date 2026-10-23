@@ -6,13 +6,6 @@ class ORMModel(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-class BootstrapIn(BaseModel):
-    token: str
-    email: EmailStr
-    full_name: str = Field(min_length=2, max_length=160)
-    password: str = Field(min_length=12, max_length=128)
-
-
 class LoginIn(BaseModel):
     email: EmailStr
     password: str
@@ -179,6 +172,7 @@ class LineIn(BaseModel):
     quantity: int = Field(gt=0)
     unit_price_cents: int = Field(ge=0)
     unit_cost_cents: int = Field(0, ge=0)
+    overhead_cost_cents: int = Field(0, ge=0)
     warranty: str | None = None
     warranty_days: int = Field(0, ge=0, le=3650)
 
@@ -214,9 +208,13 @@ class POSLineIn(BaseModel):
     item_type: str
     part_id: int | None = None
     service_id: int | None = None
+    supplier_id: int | None = None
+    supplier_reference: str | None = Field(None, max_length=100)
     description: str = Field(min_length=1, max_length=255)
     quantity: int = Field(gt=0)
     unit_price_cents: int = Field(ge=0)
+    unit_cost_cents: int = Field(0, ge=0)
+    overhead_cost_cents: int = Field(0, ge=0)
     warranty_days: int = Field(0, ge=0, le=3650)
 
     @model_validator(mode="after")

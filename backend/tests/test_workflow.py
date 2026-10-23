@@ -171,6 +171,119 @@ def test_pos_checkout_tracks_landed_cost_stock_payment_and_service_history(admin
     assert admin["client"].get("/api/v1/reports/inventory/pdf").headers["content-type"] == "application/pdf"
 
 
+def test_pos_supplier_catalog_multiline_overhead_and_audited_dispatch(admin):
+    supplier_response = post(admin, "/pos/suppliers", {
+        "company_name": "Manual POS Supplier",
+        "contact_person": "Saman Perera",
+        "phone": "+94770001122",
+        "email": "supplier@example.com",
+        "country": "Sri Lanka",
+        "supplier_reference": "POS-SUP-01",
+        "preferred_currency": "LKR",
+    })
+    assert supplier_response.status_code == 201, supplier_response.text
+    supplier = supplier_response.json()
+    assert supplier["company_name"] == "Manual POS Supplier"
+
+    profile = post(admin, "/customer-profiles", {
+        "customer": {"full_name": "Multiple Line Customer", "phone": "+94771110000"},
+        "vehicle": {"registration_number": "ML-440", "model": "440i"},
+    }).json()
+    parts = []
+    for sku, name, cost, price in (
+        ("SUP-MULTI-01", "Supplier catalog item one", 1000, 1800),
+        ("SUP-MULTI-02", "Supplier catalog item two", 2000, 3200),
+    ):
+        part = post(admin, "/parts", {
+            "sku": sku,
+            "name": name,
+            "default_supplier_id": supplier["id"],
+            "purchase_cost_cents": cost,
+            "selling_price_cents": price,
+        })
+        assert part.status_code == 201, part.text
+        parts.append(part.json())
+        receipt = post(admin, "/inventory/movements", {
+            "part_id": part.json()["id"],
+            "movement_type": "receive",
+            "quantity": 5,
+            "supplier_id": supplier["id"],
+            "unit_cost_cents": cost,
+            "document_reference": f"OPEN-{sku}",
+        })
+        assert receipt.status_code == 201, receipt.text
+
+    catalog = admin["client"].get(f"/api/v1/pos/suppliers/{supplier['id']}/items")
+    assert catalog.status_code == 200, catalog.text
+    assert {item["id"] for item in catalog.json()["items"]} == {part["id"] for part in parts}
+    assert all(item["available_qty"] == 5 for item in catalog.json()["items"])
+
+    supplier_detail = admin["client"].get(f"/api/v1/suppliers/{supplier['id']}")
+    assert supplier_detail.status_code == 200, supplier_detail.text
+    assert len(supplier_detail.json()["items"]) == 2
+
+    quotation = post(admin, "/quotations", {
+        "customer_id": profile["customer"]["id"],
+        "vehicle_id": profile["vehicle"]["id"],
+        "items": [
+            {
+                "part_id": parts[0]["id"],
+                "supplier_id": supplier["id"],
+                "supplier_reference": "SUP-LINE-1",
+                "description": parts[0]["name"],
+                "quantity": 2,
+                "unit_price_cents": 1800,
+                "unit_cost_cents": 1000,
+                "overhead_cost_cents": 100,
+            },
+            {
+                "part_id": parts[1]["id"],
+                "supplier_id": supplier["id"],
+                "supplier_reference": "SUP-LINE-2",
+                "description": parts[1]["name"],
+                "quantity": 3,
+                "unit_price_cents": 3200,
+                "unit_cost_cents": 2000,
+                "overhead_cost_cents": 200,
+            },
+        ],
+    })
+    assert quotation.status_code == 201, quotation.text
+    quotation_detail = admin["client"].get(f"/api/v1/quotations/{quotation.json()['id']}")
+    assert [item["overhead_cost_cents"] for item in quotation_detail.json()["items"]] == [100, 200]
+
+    assert post(admin, f"/quotations/{quotation.json()['id']}/approve").status_code == 200
+    order = post(admin, f"/quotations/{quotation.json()['id']}/convert")
+    assert order.status_code == 201, order.text
+    assert order.json()["direct_expenses_cents"] == 800
+
+    inventory = admin["client"].get("/api/v1/inventory/overview").json()
+    inventory_by_id = {item["id"]: item for item in inventory["items"]}
+    assert inventory_by_id[parts[0]["id"]]["reserved_qty"] == 2
+    assert inventory_by_id[parts[1]["id"]]["reserved_qty"] == 3
+
+    dispatched = post(admin, f"/orders/{order.json()['id']}/dispatch")
+    assert dispatched.status_code == 200, dispatched.text
+    inventory = admin["client"].get("/api/v1/inventory/overview").json()
+    inventory_by_id = {item["id"]: item for item in inventory["items"]}
+    assert inventory_by_id[parts[0]["id"]]["physical_qty"] == 3
+    assert inventory_by_id[parts[0]["id"]]["reserved_qty"] == 0
+    assert inventory_by_id[parts[1]["id"]]["physical_qty"] == 2
+    assert inventory_by_id[parts[1]["id"]]["reserved_qty"] == 0
+    order_issues = [movement for movement in inventory["movements"] if movement["reference_type"] == "order" and movement["reference_id"] == order.json()["id"] and movement["movement_type"] == "issue"]
+    assert len(order_issues) == 2
+    assert all(movement["supplier_id"] == supplier["id"] for movement in order_issues)
+
+    audit = admin["client"].get("/api/v1/audit-logs?size=100")
+    assert any(row["action"] == "supplier.create_from_pos" for row in audit.json()["items"])
+
+    manual = admin["client"].get("/api/v1/admin/user-manual.pdf")
+    assert manual.status_code == 200
+    assert manual.headers["content-type"] == "application/pdf"
+    assert manual.content.startswith(b"%PDF-")
+    assert len(manual.content) > 5000
+
+
 def test_backup_is_valid_sqlite(admin):
     backup = post(admin, "/admin/backups")
     assert backup.status_code == 201

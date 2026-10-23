@@ -243,6 +243,7 @@ class QuotationItem(Base):
     quantity: Mapped[int] = mapped_column(Integer)
     unit_price_cents: Mapped[int] = mapped_column(Integer)
     unit_cost_cents: Mapped[int] = mapped_column(Integer, default=0)
+    overhead_cost_cents: Mapped[int] = mapped_column(Integer, default=0)
     warranty: Mapped[str | None] = mapped_column(String(200))
     warranty_days: Mapped[int] = mapped_column(Integer, default=0)
 
@@ -274,6 +275,7 @@ class SalesOrderItem(Base):
     quantity: Mapped[int] = mapped_column(Integer)
     unit_price_cents: Mapped[int] = mapped_column(Integer)
     cost_cents: Mapped[int] = mapped_column(Integer, default=0)
+    overhead_cost_cents: Mapped[int] = mapped_column(Integer, default=0)
     warranty_days: Mapped[int] = mapped_column(Integer, default=0)
     fulfilled_qty: Mapped[int] = mapped_column(Integer, default=0)
 

@@ -23,7 +23,7 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.graphics.barcode import qr
 from reportlab.graphics.shapes import Drawing
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DBSession, selectinload
@@ -205,27 +205,6 @@ def customer_document(db: DBSession, kind: str, document_id: int) -> dict:
     raise HTTPException(422, "Unsupported document type")
 
 
-@router.get("/auth/setup-status")
-def setup_status(db: DBSession = Depends(get_db)):
-    return {"needs_setup": (db.scalar(select(func.count(User.id))) or 0) == 0}
-
-
-@router.post("/auth/bootstrap", status_code=201)
-def bootstrap(payload: BootstrapIn, request: Request, response: Response, db: DBSession = Depends(get_db)):
-    if db.scalar(select(func.count(User.id))):
-        raise HTTPException(409, "Setup has already been completed")
-    if not settings.bootstrap_token or not secrets.compare_digest(payload.token, settings.bootstrap_token):
-        raise HTTPException(403, "Invalid bootstrap token")
-    user = User(email=payload.email.lower(), full_name=payload.full_name, password_hash=hash_password(payload.password), role="Super Admin")
-    db.add(user)
-    db.flush()
-    audit(db, user, "system.bootstrap", "user", user.id, ip=request.client.host if request.client else None)
-    db.commit()
-    session = new_session(db, user)
-    response.set_cookie("emoto_session", session.raw_id, httponly=True, secure=settings.production, samesite="lax", max_age=settings.session_hours * 3600, path="/")
-    return {"user": data(user, hide={"password_hash"}), "csrf_token": session.csrf_token}
-
-
 @router.post("/auth/login")
 def login(payload: LoginIn, request: Request, response: Response, db: DBSession = Depends(get_db)):
     key = f"{request.client.host if request.client else 'unknown'}:{payload.email.lower()}"
@@ -322,6 +301,7 @@ def supplier_detail(supplier_id: int, user: User = Depends(require("suppliers:ma
     result = data(supplier)
     result["allocated_quotation_items"] = db.scalar(select(func.count()).select_from(QuotationItem).where(QuotationItem.supplier_id == supplier_id)) or 0
     result["allocated_order_items"] = db.scalar(select(func.count()).select_from(SalesOrderItem).where(SalesOrderItem.supplier_id == supplier_id)) or 0
+    result["items"] = [inventory_part_data(part) for part in db.scalars(select(Part).where(Part.default_supplier_id == supplier_id).order_by(Part.name)).all()]
     return result
 
 
@@ -486,6 +466,24 @@ def pos_suppliers(q: str = Query("", max_length=80), user: User = Depends(requir
     return {"items": [{"id": supplier.id, "code": supplier.code, "company_name": supplier.company_name, "contact_person": supplier.contact_person, "phone": supplier.phone, "supplier_reference": supplier.supplier_reference} for supplier in suppliers]}
 
 
+@router.post("/pos/suppliers", status_code=201)
+def pos_supplier_create(payload: SupplierIn, user: User = Depends(require("pos:manage")), db: DBSession = Depends(get_db)):
+    supplier = Supplier(code=sequence(db, "supplier", "SUP"), **payload.model_dump())
+    db.add(supplier); db.flush(); audit(db, user, "supplier.create_from_pos", "supplier", supplier.id); db.commit()
+    return data(supplier, hide={"bank_details"})
+
+
+@router.get("/pos/suppliers/{supplier_id}/items")
+def pos_supplier_items(supplier_id: int, user: User = Depends(require("pos:manage")), db: DBSession = Depends(get_db)):
+    supplier = db.get(Supplier, supplier_id)
+    if not supplier: raise HTTPException(404, "Supplier not found")
+    rows = [inventory_part_data(part) for part in db.scalars(select(Part).where(Part.default_supplier_id == supplier_id, Part.status == "Active").order_by(Part.name)).all()]
+    if user.role not in {"Super Admin", "Purchasing", "Inventory", "Accounts"}:
+        for item in rows:
+            item.pop("purchase_cost_cents", None); item.pop("last_purchase_cost_cents", None); item.pop("stock_value_cents", None)
+    return {"supplier": {"id": supplier.id, "code": supplier.code, "company_name": supplier.company_name}, "items": rows}
+
+
 @router.post("/pos/checkout", status_code=201)
 def pos_checkout(payload: POSCheckoutIn, user: User = Depends(require("pos:manage")), db: DBSession = Depends(get_db)):
     customer = db.get(Customer, payload.customer_id)
@@ -496,21 +494,25 @@ def pos_checkout(payload: POSCheckoutIn, user: User = Depends(require("pos:manag
     subtotal = sum(line.quantity * line.unit_price_cents for line in payload.lines)
     total = max(0, subtotal + payload.service_fee_cents - payload.discount_cents)
     if payload.payment_amount_cents > total: raise HTTPException(409, "Payment exceeds invoice total")
-    order = SalesOrder(number=sequence(db, "order", "SO"), customer_id=customer.id, vehicle_id=vehicle.id if vehicle else None, status="Fulfilled", discount_cents=payload.discount_cents, additional_charges_cents=payload.service_fee_cents, created_by=user.id)
+    direct_expenses = sum(line.quantity * line.overhead_cost_cents for line in payload.lines)
+    order = SalesOrder(number=sequence(db, "order", "SO"), customer_id=customer.id, vehicle_id=vehicle.id if vehicle else None, status="Fulfilled", direct_expenses_cents=direct_expenses, discount_cents=payload.discount_cents, additional_charges_cents=payload.service_fee_cents, created_by=user.id)
     db.add(order); db.flush()
     order_lines: list[tuple[POSLineIn, SalesOrderItem]] = []
     for line in payload.lines:
         part = db.scalar(select(Part).where(Part.id == line.part_id).with_for_update()) if line.part_id else None
         service = db.get(Service, line.service_id) if line.service_id else None
+        supplier = db.get(Supplier, line.supplier_id) if line.supplier_id else None
         if line.item_type == "part" and not part: raise HTTPException(404, f"Part not found: {line.description}")
         if line.item_type == "service" and not service: raise HTTPException(404, f"Service not found: {line.description}")
+        if line.supplier_id and not supplier: raise HTTPException(404, f"Supplier not found: {line.description}")
+        allocated_supplier_id = line.supplier_id or (part.default_supplier_id if part else None)
         if part:
             if part.physical_qty - part.reserved_qty < line.quantity: raise HTTPException(409, f"Insufficient available stock for {part.name}")
-            apply_inventory_movement(db, user, part, "issue", line.quantity, reference_type="pos", reference_id=order.id, document_reference=order.number, notes=f"POS issue for {order.number}")
-        order_item = SalesOrderItem(part_id=part.id if part else None, service_id=service.id if service else None, supplier_id=part.default_supplier_id if part else None, description=line.description, quantity=line.quantity, unit_price_cents=line.unit_price_cents, cost_cents=part.purchase_cost_cents if part else 0, warranty_days=line.warranty_days, fulfilled_qty=line.quantity)
+            apply_inventory_movement(db, user, part, "issue", line.quantity, supplier_id=allocated_supplier_id, reference_type="pos", reference_id=order.id, document_reference=order.number, notes=f"POS issue for {order.number}")
+        order_item = SalesOrderItem(part_id=part.id if part else None, service_id=service.id if service else None, supplier_id=allocated_supplier_id, supplier_reference=line.supplier_reference or (supplier.supplier_reference if supplier else None), description=line.description, quantity=line.quantity, unit_price_cents=line.unit_price_cents, cost_cents=line.unit_cost_cents or (part.purchase_cost_cents if part else 0), overhead_cost_cents=line.overhead_cost_cents, warranty_days=line.warranty_days, fulfilled_qty=line.quantity)
         order.items.append(order_item); order_lines.append((line, order_item))
     db.flush()
-    invoice = Invoice(number=sequence(db, "invoice", "INV"), order_id=order.id, customer_id=customer.id, total_cents=total, paid_cents=payload.payment_amount_cents, status="Paid" if payload.payment_amount_cents == total else "Partially Paid" if payload.payment_amount_cents else "Unpaid")
+    invoice = Invoice(number=sequence(db, "invoice", "INV"), order_id=order.id, customer_id=customer.id, issue_date=payload.service_date, total_cents=total, paid_cents=payload.payment_amount_cents, status="Paid" if payload.payment_amount_cents == total else "Partially Paid" if payload.payment_amount_cents else "Unpaid")
     invoice.items = [InvoiceItem(order_item_id=order_item.id, part_id=order_item.part_id, service_id=order_item.service_id, description=line.description, quantity=line.quantity, unit_price_cents=line.unit_price_cents, warranty_days=line.warranty_days) for line, order_item in order_lines]
     db.add(invoice); db.flush()
     if payload.payment_amount_cents:
@@ -683,13 +685,14 @@ def quotation_convert(quotation_id: int, user: User = Depends(require("orders:ma
     existing = db.scalar(select(SalesOrder).where(SalesOrder.quotation_id == quotation_id))
     if existing: return data(existing)
     if quotation.status not in {"Approved", "Accepted", "Sent"}: raise HTTPException(409, "Approve the quotation before conversion")
-    order = SalesOrder(number=sequence(db, "order", "SO"), quotation_id=quotation.id, customer_id=quotation.customer_id, vehicle_id=quotation.vehicle_id, status="Confirmed", discount_cents=quotation.discount_cents, additional_charges_cents=quotation.additional_charges_cents, created_by=user.id)
+    direct_expenses = sum(item.quantity * item.overhead_cost_cents for item in quotation.items)
+    order = SalesOrder(number=sequence(db, "order", "SO"), quotation_id=quotation.id, customer_id=quotation.customer_id, vehicle_id=quotation.vehicle_id, status="Confirmed", direct_expenses_cents=direct_expenses, discount_cents=quotation.discount_cents, additional_charges_cents=quotation.additional_charges_cents, created_by=user.id)
     db.add(order); db.flush()
     for item in quotation.items:
         part = db.get(Part, item.part_id) if item.part_id else None
         if part and part.physical_qty - part.reserved_qty >= item.quantity:
             apply_inventory_movement(db, user, part, "reserve", item.quantity, reference_type="order", reference_id=order.id, document_reference=order.number, notes=f"Reserved for {order.number}")
-        order.items.append(SalesOrderItem(part_id=item.part_id, service_id=item.service_id, supplier_id=item.supplier_id, supplier_reference=item.supplier_reference, description=item.description, quantity=item.quantity, unit_price_cents=item.unit_price_cents, cost_cents=item.unit_cost_cents or (part.purchase_cost_cents if part else 0), warranty_days=item.warranty_days))
+        order.items.append(SalesOrderItem(part_id=item.part_id, service_id=item.service_id, supplier_id=item.supplier_id, supplier_reference=item.supplier_reference, description=item.description, quantity=item.quantity, unit_price_cents=item.unit_price_cents, cost_cents=item.unit_cost_cents or (part.purchase_cost_cents if part else 0), overhead_cost_cents=item.overhead_cost_cents, warranty_days=item.warranty_days))
     quotation.status = "Converted"; db.flush(); audit(db, user, "quotation.convert", "order", order.id); db.commit()
     return data(order)
 
@@ -707,8 +710,11 @@ def dispatch_order(order_id: int, user: User = Depends(require("inventory:manage
     for item in order.items:
         if not item.part_id or item.fulfilled_qty >= item.quantity: continue
         qty = item.quantity - item.fulfilled_qty; part = db.get(Part, item.part_id)
-        if not part or part.physical_qty < qty or part.reserved_qty < qty: raise HTTPException(409, f"Reserved stock unavailable for {item.description}")
-        apply_inventory_movement(db, user, part, "issue", qty, reference_type="order", reference_id=order.id, document_reference=order.number, notes=f"Issued for {order.number}", consume_reserved=True)
+        if not part: raise HTTPException(404, f"Part not found for {item.description}")
+        reserved_for_order = db.scalar(select(func.coalesce(func.sum(InventoryMovement.reserved_delta), 0)).where(InventoryMovement.part_id == part.id, InventoryMovement.reference_type == "order", InventoryMovement.reference_id == order.id)) or 0
+        consume_reserved = reserved_for_order >= qty
+        if not consume_reserved and part.physical_qty - part.reserved_qty < qty: raise HTTPException(409, f"Stock unavailable for {item.description}")
+        apply_inventory_movement(db, user, part, "issue", qty, supplier_id=item.supplier_id, reference_type="order", reference_id=order.id, document_reference=order.number, notes=f"Issued for {order.number}", consume_reserved=consume_reserved)
         item.fulfilled_qty += qty
     order.status = "Fulfilled"; audit(db, user, "order.dispatch", "order", order.id); db.commit()
     return data(order)
@@ -1033,6 +1039,98 @@ def attachment_download(attachment_id: int, user: User = Depends(current_user), 
     path = settings.data_path / "uploads" / attachment.stored_name
     if not path.is_file(): raise HTTPException(404, "Stored file is missing")
     return FileResponse(path, media_type=attachment.content_type, filename=attachment.original_name)
+
+
+def user_manual_document() -> bytes:
+    stream = BytesIO()
+    pdf = SimpleDocTemplate(stream, pagesize=A4, rightMargin=18*mm, leftMargin=18*mm, topMargin=18*mm, bottomMargin=18*mm, title="EMOTO ERP User Manual and Terms")
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("manual-title", parent=styles["Title"], fontName="Helvetica-Bold", fontSize=23, leading=28, textColor=colors.HexColor("#176B4D"), spaceAfter=12)
+    heading_style = ParagraphStyle("manual-heading", parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=13, leading=17, textColor=colors.HexColor("#176B4D"), spaceBefore=13, spaceAfter=6)
+    body_style = ParagraphStyle("manual-body", parent=styles["BodyText"], fontName="Helvetica", fontSize=9, leading=14, textColor=colors.HexColor("#303633"), spaceAfter=6)
+    note_style = ParagraphStyle("manual-note", parent=body_style, backColor=colors.HexColor("#EDF8F2"), borderColor=colors.HexColor("#A9DBC3"), borderWidth=.5, borderPadding=8, spaceBefore=7, spaceAfter=10)
+    story = [
+        Paragraph("EMOTO ERP", title_style),
+        Paragraph("User Manual, Operating Guide, and Terms &amp; Conditions", styles["Heading1"]),
+        Paragraph(f"Prepared {date.today().isoformat()} | BMW parts, workshop, sourcing, inventory, billing, and finance", body_style),
+        Paragraph("This manual is available only to an authenticated Super Admin. Keep downloaded copies private because the guide describes internal workflows and controls.", note_style),
+    ]
+
+    sections = [
+        ("1. Sign in and access", [
+            "Open the private application URL and sign in with your assigned email and password. Never share credentials or browser sessions.",
+            "Super Admin has full control. Sales handles customers, quotations, POS, and orders. Purchasing manages suppliers and RFQs. Inventory posts stock movements. Accounts manages invoices, payments, finance, and reports.",
+        ]),
+        ("2. Customers and BMW vehicles", [
+            "Use POS or Customers to create a customer. Record phone, WhatsApp, email, billing address, and notes accurately.",
+            "Attach each BMW using its registration, model, chassis/generation, VIN, engine, year, colour, and mileage. Duplicate registrations are rejected.",
+        ]),
+        ("3. Suppliers, parts, and services", [
+            "Create suppliers with company, contact, phone, email, country, references, payment terms, delivery terms, and private bank information.",
+            "Parts can be linked to a default supplier. Selecting a supplier in POS displays its catalog items and current available quantity.",
+            "Workshop services are non-stock lines. Catalog parts are stock-controlled; manual requirements do not change inventory until linked to a catalog part.",
+        ]),
+        ("4. POS, quotations, and multiple lines", [
+            "Choose the customer and BMW, then add any number of catalog parts, workshop services, or manual requirements.",
+            "Use the plus and minus controls to change quantity. Customer price is visible on the customer document. Supplier cost and overhead are private.",
+            "A supplier can be selected or created inside the custom-line dialog. Multiple lines can be added together and allocated to that supplier.",
+            "For direct invoices, catalog part quantities are issued immediately through the inventory ledger. For quotations, stock is reserved when the approved quotation is converted to an order, when available.",
+        ]),
+        ("5. Inventory controls", [
+            "Receive purchases with supplier, quantity, unit cost, total receipt overhead, document reference, batch, date, and location. Landed average cost is recalculated automatically.",
+            "Every receipt, reservation, release, issue, return, supplier return, stocktake, and adjustment records before/after quantities, values, user, and reference.",
+            "Never edit SQLite stock values manually. Use inventory movements, order conversion, dispatch, or POS so the audit trail remains complete.",
+        ]),
+        ("6. Orders, invoices, payments, and warranties", [
+            "Approve a quotation, convert it to an order, dispatch catalog stock, and generate the invoice. Out-of-stock sourced items may be dispatched after stock is received.",
+            "Record each payment against its invoice. The system prevents overpayment and calculates the remaining balance.",
+            "Generate item warranties from the invoice. Warranty start and expiry dates use the invoice/service date and the saved duration.",
+        ]),
+        ("7. Finance, reports, backups, and recovery", [
+            "Finance separates recognized sales, captured item cost, line overhead/direct expenses, customer receipts, other income, and operating expenses.",
+            "Create regular SQLite backups in Settings and download them to encrypted offsite storage. Test restoration before relying on a backup.",
+            "Only restore while the service is stopped. Validate the selected database first and keep uploaded documents with their database backup.",
+        ]),
+    ]
+    for heading, paragraphs in sections:
+        story.append(Paragraph(heading, heading_style))
+        for item in paragraphs:
+            story.append(Paragraph(f"- {escape(item)}", body_style))
+
+    story.extend([PageBreak(), Paragraph("Operational Terms &amp; Conditions", title_style)])
+    terms = [
+        ("Authorized use", "The system is for EMOTO-authorized business users only. Access must follow the assigned role and legitimate business duties."),
+        ("Credential security", "Each person must use their own account, protect passwords, sign out from shared devices, and report suspected access immediately."),
+        ("Data accuracy", "Users are responsible for checking customer, vehicle, supplier, quantity, price, cost, tax, payment, warranty, and document information before saving or sharing."),
+        ("Inventory responsibility", "Physical stock changes must be posted only through auditable transactions. Stock counts and corrections require a truthful reason and supporting reference."),
+        ("Private commercial information", "Supplier identities, purchase costs, overhead, margins, bank details, and internal reports are confidential and must not be shown on customer copies or shared without authorization."),
+        ("Customer documents", "Quotations remain subject to their validity date, availability, final inspection, and written notes. An invoice records the saved sale but does not replace any mandatory statutory document."),
+        ("Warranty", "Warranty coverage is limited to the duration and conditions recorded for the invoice item. Claims require the original invoice and may be subject to inspection, correct installation, and exclusions stated by EMOTO or the supplier."),
+        ("Backups and continuity", "Administrators must maintain encrypted offsite backups. On-server backups alone are not disaster recovery."),
+        ("Acceptable use", "Users must not copy the system, extract confidential data, bypass controls, upload unsafe files, falsify records, or use another person's account."),
+        ("Review", "These operational terms are a working template. EMOTO should have its final customer-facing and employment terms reviewed for applicable Sri Lankan law and business requirements."),
+    ]
+    for index, (heading, description) in enumerate(terms, 1):
+        story.append(Paragraph(f"<b>{index}. {escape(heading)}</b><br/>{escape(description)}", body_style))
+    story.append(Paragraph("By using EMOTO ERP, staff acknowledge these operational responsibilities and the audit logging of sensitive actions.", note_style))
+
+    def draw_page(canvas, document):
+        canvas.saveState()
+        canvas.setStrokeColor(colors.HexColor("#24B47E")); canvas.setLineWidth(1.5)
+        canvas.line(18*mm, A4[1]-10*mm, A4[0]-18*mm, A4[1]-10*mm)
+        canvas.setFont("Helvetica", 7); canvas.setFillColor(colors.HexColor("#6B706D"))
+        canvas.drawString(18*mm, 9*mm, "EMOTO ERP - CONFIDENTIAL USER MANUAL")
+        canvas.drawRightString(A4[0]-18*mm, 9*mm, f"Page {document.page}")
+        canvas.restoreState()
+
+    pdf.build(story, onFirstPage=draw_page, onLaterPages=draw_page)
+    return stream.getvalue()
+
+
+@router.get("/admin/user-manual.pdf")
+def download_user_manual(user: User = Depends(require("backups:manage"))):
+    content = user_manual_document()
+    return StreamingResponse(BytesIO(content), media_type="application/pdf", headers={"Content-Disposition": 'inline; filename="EMOTO-ERP-user-manual-and-terms.pdf"'})
 
 
 @router.post("/admin/backups", status_code=201)

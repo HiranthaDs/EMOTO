@@ -18,14 +18,14 @@ try { npm ci } finally { Pop-Location }
 New-Item -ItemType Directory -Force -Path backend\data, backend\data\uploads, backend\data\backups | Out-Null
 if (-not (Test-Path -LiteralPath '.env')) {
     Copy-Item -LiteralPath '.env.example' -Destination '.env'
-    Write-Warning 'Created .env. Replace SESSION_SECRET and BOOTSTRAP_TOKEN before using the application.'
+    Write-Warning 'Created .env. Replace SESSION_SECRET before using the application.'
 }
 Push-Location backend
 try { & ..\.venv\Scripts\python.exe -m app.migrate } finally { Pop-Location }
 
 Write-Host ''
 Write-Host 'Setup complete.' -ForegroundColor Green
-Write-Host '1. Edit .env and set random SESSION_SECRET and BOOTSTRAP_TOKEN values.'
+Write-Host '1. Edit .env and set a random SESSION_SECRET value.'
 Write-Host '2. Run .\run_local.ps1'
-Write-Host '3. Open http://localhost:10000 and create the first administrator.'
+Write-Host '3. Open http://localhost:10000 and sign in as admin@gmail.com.'
 
